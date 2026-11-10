@@ -22,6 +22,7 @@ import {
   parseHolidays,
   parseIndex,
   parseInstitutional,
+  parseBlockTradeScope,
   parseMargin,
 } from './parsers.mjs';
 
@@ -69,7 +70,10 @@ async function fetchInstitutional(date) {
   );
   if (json.date && json.date !== ymd(date)) return { status: 'nodata' };
   const v = parseInstitutional(json);
-  return v ? { status: 'ok', value: v } : { status: 'nodata' };
+  // 以 API 說明文字判斷是否含鉅額（含：true／不含：false／無法判讀：null）
+  return v
+    ? { status: 'ok', value: v, blockIncluded: parseBlockTradeScope(json.notes) }
+    : { status: 'nodata' };
 }
 
 async function fetchMargin(date) {
@@ -221,9 +225,15 @@ async function main() {
     try {
       const r = await fetchInstitutional(today);
       if (r.status === 'ok') {
-        changed =
-          apply(state, 'institutional', today, r.value, nowIso, { stage: institutionalStage(now) }) ||
-          changed;
+        // 以證交所說明文字為準；說明文字缺漏時才退回依時間判斷（20:00 前不含、後含）
+        const stage =
+          r.blockIncluded === true
+            ? 'with_block'
+            : r.blockIncluded === false
+              ? 'ex_block'
+              : institutionalStage(now);
+        console.log(`三大法人：證交所說明文字判定為 ${r.blockIncluded === null ? `（無法判讀，依時間）${stage}` : stage}`);
+        changed = apply(state, 'institutional', today, r.value, nowIso, { stage }) || changed;
       }
     } catch (e) {
       console.warn(`三大法人抓取失敗：${e.message}`);
@@ -257,3 +267,4 @@ main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
 });
+

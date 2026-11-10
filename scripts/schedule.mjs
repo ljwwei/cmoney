@@ -66,3 +66,4 @@ export function dueTasks(state, now = new Date()) {
 export function institutionalStage(now = new Date()) {
   return taipeiParts(now).minutes >= START_AT.institutionalBlock ? 'with_block' : 'ex_block';
 }
+

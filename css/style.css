@@ -250,3 +250,4 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   .card__foot { font-size: 0.72rem; }
   .site-foot { padding: 4px 16px calc(24px + env(safe-area-inset-bottom)); }
 }
+

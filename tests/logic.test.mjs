@@ -106,3 +106,12 @@ test('融資與買賣超格式', () => {
   assert.equal(marginDiffYi(536678732, 539915741), -32.4);
   assert.equal(toYiSigned(-34116689906), '−341.17');
 });
+
+import { parseBlockTradeScope } from '../scripts/parsers.mjs';
+
+test('依證交所說明文字判斷是否含鉅額', () => {
+  assert.equal(parseBlockTradeScope(['x', '本統計資訊含一般、零股、盤後定價、鉅額，不含拍賣、標購。']), true);
+  assert.equal(parseBlockTradeScope(['本統計資訊含一般、零股、盤後定價，不含鉅額、拍賣、標購。']), false);
+  assert.equal(parseBlockTradeScope(['其他說明']), null);
+  assert.equal(parseBlockTradeScope(undefined), null);
+});

@@ -31,6 +31,25 @@ export function parseIndex(json) {
   return null;
 }
 
+/**
+ * 從 BFI82U 回傳的 notes 判斷統計範圍是否含鉅額。
+ * 證交所說明文字：
+ *   含鉅額　→「本統計資訊含一般、零股、盤後定價、鉅額，不含拍賣、標購。」
+ *   不含鉅額 → 鉅額會被列在「不含」之後
+ * 回傳 true（含）、false（不含）、null（說明文字缺漏或無法判讀）。
+ */
+export function parseBlockTradeScope(notes) {
+  const note = (Array.isArray(notes) ? notes : []).find((n) => /本統計資訊/.test(String(n)));
+  if (!note) return null;
+  const text = String(note).replace(/<[^>]*>/g, '');
+  const i = text.indexOf('不含');
+  const included = i >= 0 ? text.slice(0, i) : text;
+  const excluded = i >= 0 ? text.slice(i) : '';
+  if (included.includes('鉅額')) return true;
+  if (excluded.includes('鉅額')) return false;
+  return null;
+}
+
 /** 證交所 BFI82U：三大法人買賣金額統計表（單位：元） */
 export function parseInstitutional(json) {
   if (!json || json.stat !== 'OK' || !Array.isArray(json.data)) return null;
@@ -104,3 +123,4 @@ export function parseHolidays(list) {
   }
   return closed;
 }
+
