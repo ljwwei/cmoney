@@ -1,0 +1,15 @@
+{
+  "name": "cmoney",
+  "version": "1.0.0",
+  "private": true,
+  "description": "台股資訊網站：加權指數、三大法人、外資期貨未平倉、融資餘額",
+  "type": "module",
+  "scripts": {
+    "fetch": "node scripts/fetch.mjs",
+    "test": "node --test tests/",
+    "serve": "node scripts/serve.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
