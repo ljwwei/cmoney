@@ -95,7 +95,11 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   flex-direction: column;
   min-width: 0;
 }
-.card.is-pending { border-color: color-mix(in srgb, var(--warn) 45%, var(--card-border)); }
+/* 尚未揭露：外框與提示字同色並加粗（1px 邊框 + 2px 外環 = 3px；用 box-shadow 疊加，版面不會位移） */
+.card.is-pending {
+  border-color: var(--warn);
+  box-shadow: 0 0 0 2px var(--warn), var(--shadow);
+}
 
 .card__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .card__head h2 { margin: 0; font-size: 1rem; color: var(--muted); font-weight: 600; letter-spacing: 0.06em; }
