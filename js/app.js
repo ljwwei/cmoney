@@ -94,7 +94,9 @@ function renderIndex(d) {
         <span class="chip ${cls}">${pct}</span>
       </div>
     </div>
-    <p class="sub">較前一交易日收盤</p>`;
+    <p class="sub">較前一交易日收盤${
+      d.source === 'mis' ? '<br>暫用證交所即時行情終盤值，稍後以盤後正式資料確認' : ''
+    }</p>`;
 }
 
 function renderInst(d) {
@@ -219,13 +221,50 @@ export function renderAll() {
     : '資料更新：—';
 }
 
+/**
+ * GitHub Pages 發佈要等 Pages 部署（通常 30 秒～數分鐘），所以另外直接讀 GitHub API 上的最新檔案，
+ * 兩邊取較新的一份。僅在 *.github.io 上、且是盤後資料可能更新的時段才讀（避免耗用 API 額度）。
+ */
+function githubApiUrl() {
+  if (typeof location === 'undefined' || !location.hostname.endsWith('.github.io')) return null;
+  const owner = location.hostname.split('.')[0];
+  const repo = location.pathname.split('/')[1];
+  return repo ? `https://api.github.com/repos/${owner}/${repo}/contents/data/data.json` : null;
+}
+
+function inFreshWindow() {
+  const { date, time } = taipeiNow();
+  return isTradingDay(date, state?.closedDates ?? []) && time >= '13:25:00' && time < '23:59:59';
+}
+
+async function fetchPages() {
+  const res = await fetch(`data/data.json?t=${Date.now()}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(res.status);
+  return res.json();
+}
+
+async function fetchGithubApi() {
+  const url = githubApiUrl();
+  if (!url || !inFreshWindow()) return null;
+  // cache: 'no-cache' 會帶 ETag 重新驗證；沒變時回 304，不佔 API 額度
+  const res = await fetch(url, {
+    cache: 'no-cache',
+    headers: { Accept: 'application/vnd.github.raw+json' },
+  });
+  if (!res.ok) throw new Error(res.status);
+  return res.json();
+}
+
+const newer = (a, b) => ((a?.meta?.updatedAt ?? '') >= (b?.meta?.updatedAt ?? '') ? a : b);
+
 async function load() {
-  try {
-    const res = await fetch(`data/data.json?t=${Date.now()}`, { cache: 'no-store' });
-    if (!res.ok) throw new Error(res.status);
-    state = await res.json();
-  } catch (e) {
-    console.warn('讀取資料失敗', e);
+  if (typeof document !== 'undefined' && document.hidden && state) return; // 分頁在背景時不更新
+  const [pages, api] = await Promise.allSettled([fetchPages(), fetchGithubApi()]);
+  const got = [pages, api].filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
+  if (got.length) {
+    state = got.reduce(newer);
+  } else {
+    console.warn('讀取資料失敗', pages.reason);
     if (!state) {
       for (const c of CARDS) {
         document.querySelector(`#${c.id} .card__body`).innerHTML = '<p class="empty">資料讀取失敗，請稍後重新整理</p>';
@@ -237,6 +276,9 @@ async function load() {
 
 if (typeof document !== 'undefined') {
   load();
-  setInterval(load, 60 * 1000); // 每分鐘取得最新資料
+  setInterval(load, 30 * 1000); // 每 30 秒取得最新資料
   setInterval(renderAll, 1000); // 每秒更新時鐘；跨過 00:00 時自動切換「尚未揭露」狀態
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) load();
+  });
 }

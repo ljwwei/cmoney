@@ -1,13 +1,24 @@
 name: Update TW stock data
 
+# 為什麼不是「每 5 分鐘一個 cron 各跑一次」？
+# GitHub 的排程 cron 是「盡力而為」：免費帳號在尖峰時會大量延遲甚至整批跳過，
+# 實測 13:40–14:49 之間一次都沒有觸發，導致資料晚了一個多小時才更新。
+# 所以改成「常駐輪詢」：cron 只負責把輪詢工作「叫起來」（多個時間點互相備援），
+# 一旦起來，就在同一個 job 內每 30 秒抓一次，直到今天的項目都抓齊為止。
+# 單一 job 上限 6 小時，所以接近上限時會用 workflow_dispatch 自己接力。
+
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/update.yml'
   schedule:
-    # GitHub cron 使用 UTC；台北時間 = UTC+8。只在週一至週五、台北 13:40–23:59 之間每 5 分鐘觸發。
-    # 實際「該不該抓」由 scripts/fetch.mjs 依交易日與各項目的開始時間判斷，非交易日會直接結束。
-    - cron: '40-59/5 5 * * 1-5'   # 台北 13:40–13:59
-    - cron: '*/5 6-15 * * 1-5'    # 台北 14:00–23:55
-    # 台北 08:30：更新證交所休市日行事曆（颱風等臨時休市通常早上公告）
+    # GitHub cron 使用 UTC；台北時間 = UTC+8。
+    # 台北 08:30：更新證交所休市日行事曆（颱風等臨時休市通常早上公告），只跑一輪
     - cron: '30 0 * * 1-5'
+    # 台北 13:00–22:40 每 20 分鐘：喚醒常駐輪詢（已在跑或今天已抓齊時，會自動略過／立刻結束）
+    - cron: '*/20 5-14 * * 1-5'
   workflow_dispatch:
     inputs:
       date:
@@ -17,8 +28,9 @@ on:
 
 permissions:
   contents: write
+  actions: write # 接力：以 workflow_dispatch 啟動下一個輪詢 job
 
-# 同一時間只跑一個，避免互相 push 衝突
+# 同一時間只跑一個（避免互相 push 衝突）；排隊中的只保留最新一個，不會取消正在輪詢的
 concurrency:
   group: update-data
   cancel-in-progress: false
@@ -26,7 +38,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,6 +47,8 @@ jobs:
       - name: Fetch and commit
         env:
           BACKFILL_DATE: ${{ github.event.inputs.date }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "cmoney-bot"
           git config user.email "cmoney-bot@users.noreply.github.com"
@@ -44,25 +58,57 @@ jobs:
             if ! git diff --cached --quiet; then
               git commit -m "chore: update data $(TZ=Asia/Taipei date +'%Y-%m-%d %H:%M')"
               for i in 1 2 3; do
-                git pull --rebase && git push && break
+                if git pull --rebase --autostash && git push; then
+                  return 0
+                fi
+                git rebase --abort 2>/dev/null || true
                 sleep $((i * 3))
               done
+              echo "::warning::push 失敗，下一輪會再試"
             fi
           }
 
+          # 手動補抓指定日期
           if [ -n "$BACKFILL_DATE" ]; then
             node scripts/fetch.mjs --date="$BACKFILL_DATE" || true
             commit_and_push
             exit 0
           fi
 
-          # 融資餘額 20:35 後需每 2 分鐘抓一次：一次 cron 內最多跑 3 輪（0、2、4 分鐘）
-          for round in 1 2 3; do
+          # 08:30 休市日行事曆檢查：只跑一輪
+          if [ "$EVENT_SCHEDULE" = "30 0 * * 1-5" ]; then
+            node scripts/fetch.mjs || true
+            commit_and_push
+            exit 0
+          fi
+
+          # 常駐輪詢：每 30 秒一輪。
+          #   fetch.mjs 結束碼 0  = 今天沒事了（非交易日／全部抓齊／已過 23:55）→ 結束
+          #   fetch.mjs 結束碼 10 = 今天還有項目沒抓齊 → 30 秒後再跑
+          DEADLINE=$((SECONDS + 5 * 3600 + 30 * 60))
+          errors=0
+          while true; do
             code=0
             node scripts/fetch.mjs || code=$?
             commit_and_push
-            [ "$code" -eq 10 ] || break   # 結束碼 10 = 融資餘額尚未取得，2 分鐘後再試
-            [ "$round" -lt 3 ] && sleep 120
-          done
-          exit 0
 
+            if [ "$code" -eq 0 ]; then
+              echo "今天的項目都處理完了，結束輪詢。"
+              exit 0
+            elif [ "$code" -eq 10 ]; then
+              errors=0
+            else
+              errors=$((errors + 1))
+              if [ "$errors" -ge 10 ]; then
+                echo "::error::fetch.mjs 連續 10 次異常結束（code=$code）"
+                exit 1
+              fi
+            fi
+
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "接近單一 job 上限，啟動下一個輪詢 job 接力。"
+              gh workflow run update.yml --ref "$GITHUB_REF_NAME" || true
+              exit 0
+            fi
+            sleep 30
+          done

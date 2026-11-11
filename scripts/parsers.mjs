@@ -32,6 +32,44 @@ export function parseIndex(json) {
 }
 
 /**
+ * 證交所即時行情 mis getStockInfo（ex_ch=tse_t00.tw，加權指數）。
+ * 13:30 收盤後，最後一筆（t ≥ 13:30:00）即為終盤指數；y 為前一交易日收盤。
+ * 回傳 null 代表：不是指定日期的資料、尚未收盤、或欄位缺漏。
+ * @param {object} json mis 回傳
+ * @param {string} date YYYY-MM-DD
+ */
+export function parseMisIndex(json, date) {
+  const item = json?.msgArray?.[0];
+  if (!item || item.d !== date.replace(/-/g, '')) return null;
+  if (String(item.t ?? '') < '13:30:00') return null; // 盤中即時值，不是收盤
+  const close = num(item.z);
+  const prev = num(item.y);
+  if (!Number.isFinite(close) || !Number.isFinite(prev) || prev <= 0) return null;
+  const change = +(close - prev).toFixed(2);
+  return { close, change, changePct: +((change / prev) * 100).toFixed(2) };
+}
+
+/**
+ * 證交所 OpenAPI /indicesReport/MI_5MINS_HIST（發行量加權股價指數歷史資料，日資料）。
+ * 日期為民國 yyyMMdd；漲跌以清單中前一個交易日收盤計算（月初第一天無前一筆時為 null）。
+ */
+export function parseOpenApiIndexHist(list, date) {
+  if (!Array.isArray(list)) return null;
+  const roc = (d) => `${Number(d.slice(0, 4)) - 1911}${d.slice(5, 7)}${d.slice(8, 10)}`;
+  const rows = list
+    .map((r) => ({ date: String(r.Date ?? '').trim(), close: num(r.ClosingIndex) }))
+    .filter((r) => r.date && Number.isFinite(r.close))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const i = rows.findIndex((r) => r.date === roc(date));
+  if (i < 0) return null;
+  const close = rows[i].close;
+  if (i === 0) return { close, change: null, changePct: null };
+  const prev = rows[i - 1].close;
+  const change = +(close - prev).toFixed(2);
+  return { close, change, changePct: +((change / prev) * 100).toFixed(2) };
+}
+
+/**
  * 從 BFI82U 回傳的 notes 判斷統計範圍是否含鉅額。
  * 證交所說明文字：
  *   含鉅額　→「本統計資訊含一般、零股、盤後定價、鉅額，不含拍賣、標購。」

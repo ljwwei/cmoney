@@ -4,14 +4,15 @@
 //   node scripts/fetch.mjs                  依目前台北時間，只抓「此刻該抓」的項目
 //   node scripts/fetch.mjs --date=2026-11-10  補抓指定日期（視為該日 23:59，所有項目都到時間）
 //
-// 結束碼 10 代表「融資餘額仍在 20:35 後的 2 分鐘輪詢區間且尚未取得」，
-// 由 workflow 依此決定是否 2 分鐘後再跑一次。
+// 結束碼：0 = 今天沒事了（非交易日／全部抓齊／已過 23:55）；
+//         10 = 今天還有項目沒抓齊，常駐輪詢（workflow）應稍後再跑一次。
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   dueTasks,
+  remainingTasks,
   institutionalStage,
   isTradingDay,
   taipeiParts,
@@ -24,6 +25,8 @@ import {
   parseInstitutional,
   parseBlockTradeScope,
   parseMargin,
+  parseMisIndex,
+  parseOpenApiIndexHist,
 } from './parsers.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -38,14 +41,22 @@ async function httpGet(url, init = {}, tries = 3) {
     try {
       const res = await fetch(url, {
         ...init,
-        headers: { 'User-Agent': UA, Accept: '*/*', ...(init.headers ?? {}) },
-        signal: AbortSignal.timeout(25000),
+        // 不吃任何中間快取：「尚無資料」的回應若被快取，會讓抓取延遲到快取過期
+        cache: 'no-store',
+        headers: {
+          'User-Agent': UA,
+          Accept: '*/*',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+          ...(init.headers ?? {}),
+        },
+        signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return Buffer.from(await res.arrayBuffer());
     } catch (e) {
       lastErr = e;
-      if (i < tries) await new Promise((r) => setTimeout(r, i * 1500));
+      if (i < tries) await new Promise((r) => setTimeout(r, i * 1000));
     }
   }
   throw lastErr;
@@ -55,18 +66,60 @@ const getJson = async (url) => JSON.parse((await httpGet(url)).toString('utf8'))
 
 // ---- 各資料來源。回傳 { status: 'ok' | 'nodata', value } ；網路錯誤則丟出例外 ----
 
-async function fetchIndex(date) {
+// 加權指數有三個來源，依序取用：
+//   1. 證交所盤後統計 MI_INDEX（正式資料，含漲跌點數與百分比）
+//   2. 證交所即時行情 mis（13:30 收盤後約 13:33 就有終盤值，比盤後統計早）
+//   3. 證交所 OpenAPI MI_5MINS_HIST（歷史日資料；前兩者都失敗時的備援）
+// 先拿到 mis 的值會標記 source = 'mis'，之後 MI_INDEX 出來會自動覆蓋為正式值。
+async function fetchIndexTwse(date) {
   const json = await getJson(
-    `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${ymd(date)}&type=IND&response=json`,
+    `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${ymd(date)}&type=IND&response=json&_=${Date.now()}`,
   );
   if (json.date && json.date !== ymd(date)) return { status: 'nodata' };
   const v = parseIndex(json);
   return v ? { status: 'ok', value: v } : { status: 'nodata' };
 }
 
+async function fetchIndexMis(date) {
+  const json = await getJson(
+    `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0&_=${Date.now()}`,
+  );
+  const v = parseMisIndex(json, date);
+  return v ? { status: 'ok', value: v } : { status: 'nodata' };
+}
+
+async function fetchIndexOpenApi(date) {
+  const list = await getJson('https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST');
+  const v = parseOpenApiIndexHist(list, date);
+  return v ? { status: 'ok', value: v } : { status: 'nodata' };
+}
+
+/**
+ * 回傳 { status: 'ok', value, source } 或 { status: 'nodata', certain }。
+ * certain = 兩個主要來源都「正常回應、但確定沒有今日資料」（用於判斷臨時休市；網路錯誤不算）。
+ */
+async function fetchIndex(date) {
+  const [twse, mis] = await Promise.allSettled([fetchIndexTwse(date), fetchIndexMis(date)]);
+  const ok = (r) => r.status === 'fulfilled' && r.value.status === 'ok';
+  for (const [name, r] of [['MI_INDEX', twse], ['mis', mis]]) {
+    if (r.status === 'rejected') console.warn(`加權指數來源 ${name} 失敗：${r.reason?.message ?? r.reason}`);
+  }
+  if (ok(twse)) return { status: 'ok', value: twse.value.value, source: 'twse' };
+  if (ok(mis)) return { status: 'ok', value: mis.value.value, source: 'mis' };
+
+  try {
+    const r = await fetchIndexOpenApi(date);
+    if (r.status === 'ok') return { status: 'ok', value: r.value, source: 'openapi' };
+  } catch (e) {
+    console.warn(`加權指數來源 OpenAPI 失敗：${e.message}`);
+  }
+  if (twse.status === 'rejected' && mis.status === 'rejected') throw twse.reason;
+  return { status: 'nodata', certain: twse.status === 'fulfilled' && mis.status === 'fulfilled' };
+}
+
 async function fetchInstitutional(date) {
   const json = await getJson(
-    `https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&dayDate=${ymd(date)}&response=json`,
+    `https://www.twse.com.tw/rwd/zh/fund/BFI82U?type=day&dayDate=${ymd(date)}&response=json&_=${Date.now()}`,
   );
   if (json.date && json.date !== ymd(date)) return { status: 'nodata' };
   const v = parseInstitutional(json);
@@ -78,7 +131,7 @@ async function fetchInstitutional(date) {
 
 async function fetchMargin(date) {
   const json = await getJson(
-    `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=${ymd(date)}&selectType=MS&response=json`,
+    `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=${ymd(date)}&selectType=MS&response=json&_=${Date.now()}`,
   );
   if (json.date && json.date !== ymd(date)) return { status: 'nodata' };
   const v = parseMargin(json);
@@ -188,14 +241,14 @@ async function main() {
             changePct = +((change / prev.close) * 100).toFixed(2);
           }
         }
-        changed = apply(state, 'index', today, { close, change, changePct }, nowIso) || changed;
+        changed = apply(state, 'index', today, { close, change, changePct }, nowIso, { source: r.source }) || changed;
         // 若這天先前被誤判為臨時休市，現在有資料就撤銷
         if (state.inferredClosed.includes(today)) {
           state.inferredClosed = state.inferredClosed.filter((d) => d !== today);
           state.closedDates = state.closedDates.filter((d) => d !== today);
           changed = true;
         }
-      } else if (minutes >= INFER_CLOSED_AT && !backfill) {
+      } else if (minutes >= INFER_CLOSED_AT && !backfill && r.certain) {
         console.log(`${today} 已過 ${INFER_CLOSED_AT / 60}:00 仍無加權指數資料，判定為臨時休市，今日不再抓取。`);
         state.inferredClosed = [...new Set([...state.inferredClosed, today])].sort();
         state.closedDates = [...new Set([...state.closedDates, today])].sort();
@@ -253,8 +306,8 @@ async function main() {
   if (changed) await finish(state, nowIso);
   else console.log('無資料變動。');
 
-  // 融資餘額仍在 2 分鐘輪詢區間 → 通知 workflow 稍後再跑
-  if (!backfill && dueTasks(state, new Date()).includes('margin')) process.exitCode = 10;
+  // 今天還有項目沒抓齊 → 通知 workflow 的常駐輪詢稍後再跑
+  if (!backfill && remainingTasks(state, new Date()).length) process.exitCode = 10;
 }
 
 async function finish(state, nowIso) {

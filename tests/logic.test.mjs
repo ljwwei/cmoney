@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dueTasks, isTradingDay, taipeiParts, institutionalStage } from '../scripts/schedule.mjs';
-import { parseHolidays, parseMargin, parseFuturesCsv, parseIndex } from '../scripts/parsers.mjs';
+import { dueTasks, remainingTasks, isTradingDay, taipeiParts, institutionalStage } from '../scripts/schedule.mjs';
+import {
+  parseHolidays,
+  parseMargin,
+  parseFuturesCsv,
+  parseIndex,
+  parseMisIndex,
+  parseOpenApiIndexHist,
+} from '../scripts/parsers.mjs';
 
 // 以台北時間建立 Date
 const tpe = (s) => new Date(`${s}+08:00`);
@@ -23,11 +30,11 @@ test('非交易日永遠不抓', () => {
 
 test('各項目開始時間', () => {
   const s = { closedDates: [] };
-  assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:39:00')), []);
-  assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:40:00')), ['index']);
-  assert.deepEqual(dueTasks(s, tpe('2026-11-10T14:50:00')), ['index', 'futures']);
-  assert.deepEqual(dueTasks(s, tpe('2026-11-10T15:00:00')), ['index', 'futures', 'institutional']);
-  assert.deepEqual(dueTasks(s, tpe('2026-11-10T20:35:00')), ['index', 'futures', 'institutional', 'margin']);
+  assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:29:00')), []);
+  assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:30:00')), ['index']);
+  assert.deepEqual(dueTasks(s, tpe('2026-11-10T14:30:00')), ['index', 'futures', 'institutional']);
+  assert.deepEqual(dueTasks(s, tpe('2026-11-10T20:29:00')), ['index', 'futures', 'institutional']);
+  assert.deepEqual(dueTasks(s, tpe('2026-11-10T20:30:00')), ['index', 'futures', 'institutional', 'margin']);
 });
 
 test('已抓到當日資料就不再抓；三大法人在 20:00 後再抓一次含鉅額', () => {
@@ -45,6 +52,34 @@ test('已抓到當日資料就不再抓；三大法人在 20:00 後再抓一次�
   assert.deepEqual(dueTasks(s, tpe('2026-11-10T20:40:00')), []);
 });
 
+test('加權指數先取得即時行情值（mis），要等證交所正式資料確認；18:00 後不再追', () => {
+  const day = '2026-11-10';
+  const s = { closedDates: [], index: { date: day, source: 'mis' } };
+  const hasIndex = (time) => dueTasks(s, tpe(`2026-11-10T${time}`)).includes('index');
+  assert.equal(hasIndex('13:40:00'), true);
+  assert.equal(hasIndex('17:59:00'), true);
+  assert.equal(hasIndex('18:00:00'), false);
+  s.index.source = 'twse';
+  assert.equal(hasIndex('13:40:00'), false);
+});
+
+test('remainingTasks：今天還沒抓齊的項目（不論開始時間），供常駐輪詢決定是否繼續', () => {
+  const day = '2026-11-10';
+  const s = { closedDates: [] };
+  assert.deepEqual(remainingTasks(s, tpe('2026-11-10T13:00:00')), ['index', 'futures', 'institutional', 'margin']);
+  Object.assign(s, {
+    index: { date: day, source: 'twse' },
+    futures: { date: day },
+    institutional: { date: day, stage: 'ex_block' },
+  });
+  assert.deepEqual(remainingTasks(s, tpe('2026-11-10T16:00:00')), ['institutional', 'margin']);
+  s.institutional.stage = 'with_block';
+  s.margin = { date: day };
+  assert.deepEqual(remainingTasks(s, tpe('2026-11-10T21:00:00')), []);
+  // 非交易日、跨過當日截止時間 → 沒事了
+  assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-14T15:00:00')), []);
+  assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T23:55:00')), []);
+});
 test('前一日的資料不算當日資料', () => {
   const s = { closedDates: [], index: { date: '2026-11-09' } };
   assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:45:00')), ['index']);
@@ -114,4 +149,23 @@ test('依證交所說明文字判斷是否含鉅額', () => {
   assert.equal(parseBlockTradeScope(['本統計資訊含一般、零股、盤後定價，不含鉅額、拍賣、標購。']), false);
   assert.equal(parseBlockTradeScope(['其他說明']), null);
   assert.equal(parseBlockTradeScope(undefined), null);
+});
+
+test('即時行情 mis：收盤後（t ≥ 13:30）才算終盤值，漲跌以前收計算', () => {
+  const mk = (o) => ({ msgArray: [{ d: '20261111', t: '13:33:00', z: '44257.15', y: '42711.92', ...o }] });
+  assert.deepEqual(parseMisIndex(mk({}), '2026-11-11'), { close: 44257.15, change: 1545.23, changePct: 3.62 });
+  assert.equal(parseMisIndex(mk({ t: '13:29:55' }), '2026-11-11'), null); // 盤中
+  assert.equal(parseMisIndex(mk({ d: '20261110' }), '2026-11-11'), null); // 昨天的資料（今天休市）
+  assert.equal(parseMisIndex(mk({ z: '-' }), '2026-11-11'), null);
+  assert.equal(parseMisIndex({ msgArray: [] }, '2026-11-11'), null);
+});
+
+test('OpenAPI 加權指數歷史資料：民國日期、漲跌以前一筆計算', () => {
+  const list = [
+    { Date: '1151110', ClosingIndex: '42711.92' },
+    { Date: '1151111', ClosingIndex: '44257.15' },
+  ];
+  assert.deepEqual(parseOpenApiIndexHist(list, '2026-11-11'), { close: 44257.15, change: 1545.23, changePct: 3.62 });
+  assert.deepEqual(parseOpenApiIndexHist(list, '2026-11-10'), { close: 42711.92, change: null, changePct: null });
+  assert.equal(parseOpenApiIndexHist(list, '2026-11-12'), null);
 });
