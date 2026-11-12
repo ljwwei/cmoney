@@ -195,6 +195,13 @@ function renderCard(card, state, today) {
       : '當日資訊尚未揭露';
   }
   el.classList.toggle('is-pending', pending);
+
+  // 三大法人：已取得當日不含鉅額版本、等待 20:00 後含鉅額版本。
+  // 保留提示文字，但不加粗框（粗框只用在「當日資訊尚未揭露」）
+  if (card.key === 'institutional' && d && d.date === today && d.stage === 'ex_block') {
+    notice.hidden = false;
+    notice.textContent = '目前為不含鉅額版本，20:00 後將更新為含鉅額';
+  }
 }
 
 let state = null;
