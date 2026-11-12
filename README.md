@@ -28,11 +28,15 @@
 
 > `/indicesReport/MFI94U` 是「發行量加權股價**報酬**指數」，不是我們要的加權股價指數，所以不採用。
 
-### 為什麼用「常駐輪詢」而不是每 5 分鐘一個 cron？
-GitHub Actions 的排程 cron 是盡力而為，免費帳號尖峰時會大量延遲／跳過（實測 13:40–14:49 完全沒觸發，資料晚了一小時多）。
-所以 cron（每 10 分鐘，12:00–22:50，避開整點尖峰）只負責「叫起來」，job 起來後在同一個 job 內自己每 30 秒輪詢，直到今天的項目抓齊才結束；
-單一 job 上限 6 小時，接近時以 `workflow_dispatch` 自己接力。`concurrency` 為 `cancel-in-progress: false`：同時只會有 1 個 job 在輪詢，新觸發只排隊（只留最新 1 個），**不可**改成 `true`，否則每次 cron 觸發都會砍掉正在輪詢的 job。`push` 到 `scripts/**` 也會立刻啟動一次。
-前端除了 GitHub Pages 的 `data.json`，也會（13:25 後）直接讀 GitHub API 上最新的檔案，兩邊取較新者，省去 Pages 部署延遲。
+### 排程喚醒架構（雙軌制）
+1. **主力喚醒（Cloudflare Workers Cron）**：
+   GitHub Actions 的免費原生 cron 常有尖峰延遲與漏跑問題。因此透過外部 Cloudflare Worker 的 Cron Trigger（平日 13:25–21:25 每小時 25 分準點發動），分秒不差地發送 `workflow_dispatch` 呼叫 GitHub Actions。
+2. **備援喚醒（GitHub Actions 內建排程）**：
+   在平日 13:30、14:30、20:30（三大關鍵開盤/揭露時段）設置備援 cron，即使外部網路異常也能自動補位。
+3. **常駐輪詢**：
+   job 只要被喚醒，便會在同一個 runner 內每 30 秒執行一次抓取，直到當日所有項目抓齊才優雅退出。單一 job 上限 6 小時，接近時會自我接力。`concurrency` 設定 `cancel-in-progress: false` 確保同時間只有 1 個 job 在輪詢。
+4. **前端即時同步**：
+   除了 GitHub Pages 的 `data.json`，前端在盤後時段（13:25 後）也會直接透過 GitHub API 讀取最新 raw 檔案，免去 Pages 部署的等待延遲。
 
 ### 非交易日機制
 1. 週六、週日不抓。
