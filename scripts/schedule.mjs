@@ -52,6 +52,8 @@ function isDone(task, state, today, minutes) {
   if (d?.date !== today) return false;
   if (task === 'index') return d.source !== 'mis' || minutes >= INDEX_CONFIRM_UNTIL;
   if (task === 'institutional') return d.stage === 'with_block';
+  // 已存的資料若是整列 0（舊版沒有防呆時存進去的），不算抓齊，要重抓
+  if (task === 'futures') return !(d.long === 0 && d.short === 0);
   return true;
 }
 

@@ -6,6 +6,7 @@ import {
   parseMargin,
   parseFuturesCsv,
   parseIndex,
+  parseInstitutional,
   parseMisIndex,
   parseOpenApiIndexHist,
 } from '../scripts/parsers.mjs';
@@ -168,4 +169,24 @@ test('OpenAPI 加權指數歷史資料：民國日期、漲跌以前一筆計算
   assert.deepEqual(parseOpenApiIndexHist(list, '2026-11-11'), { close: 44257.15, change: 1545.23, changePct: 3.62 });
   assert.deepEqual(parseOpenApiIndexHist(list, '2026-11-10'), { close: 42711.92, change: null, changePct: null });
   assert.equal(parseOpenApiIndexHist(list, '2026-11-12'), null);
+});
+test('防呆：外資期貨整列全 0（期交所尚未提供正式資料）視為無資料', () => {
+  const head = '日期,商品名稱,身份別,a,b,c,d,e,f,g,h,i,j,k,l';
+  const zero = '2026/11/12,臺股期貨,外資及陸資,0,0,0,0,0,0,0,0,0,0,0,0';
+  assert.equal(parseFuturesCsv([head, zero].join('\r\n'), '2026-11-12'), null);
+  // 多空未平倉都是 0 也不是正常資料
+  const openZero = '2026/11/12,臺股期貨,外資及陸資,100,1,90,1,10,1,0,0,0,0,0,0';
+  assert.equal(parseFuturesCsv([head, openZero].join('\r\n'), '2026-11-12'), null);
+  const ok = '2026/11/12,臺股期貨,外資及陸資,86285,1,88046,1,-1761,1,9875,1,113348,1,-103473,1';
+  assert.equal(parseFuturesCsv([head, ok].join('\r\n'), '2026-11-12').foreignNet, -103473);
+});
+
+test('防呆：三大法人／融資全 0 視為無資料', () => {
+  const z = ['0', '0', '0'];
+  const inst = {
+    stat: 'OK',
+    data: [['自營商(自行買賣)', ...z], ['自營商(避險)', ...z], ['投信', ...z], ['外資及陸資(不含外資自營商)', ...z], ['合計', ...z]],
+  };
+  assert.equal(parseInstitutional(inst), null);
+  assert.equal(parseMargin({ stat: 'OK', tables: [{ data: [['融資金額(仟元)', '0', '0', '0', '0', '0']] }] }), null);
 });

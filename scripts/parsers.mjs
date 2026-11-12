@@ -111,6 +111,8 @@ export function parseInstitutional(json) {
   const total = pick('合計');
   if (!dealer || !trust || !foreign) return null;
   if ([dealer, trust, foreign].some((x) => Object.values(x).some(Number.isNaN))) return null;
+  // 防呆：整張表金額全是 0 不是正常資料（尚未開始提供），視為無資料
+  if ([dealer, trust, foreign].every((x) => x.buy === 0 && x.sell === 0)) return null;
   return { dealer, trust, foreign, total };
 }
 
@@ -123,6 +125,7 @@ export function parseMargin(json) {
       const prevBalance = num(row[4]);
       const balance = num(row[5]);
       if (!Number.isFinite(balance) || !Number.isFinite(prevBalance)) return null;
+      if (balance === 0 && prevBalance === 0) return null; // 全 0 不是正常資料
       return { balance, prevBalance };
     }
   }
@@ -143,6 +146,12 @@ export function parseFuturesCsv(csv, date) {
     if (c[0] !== want || c[1] !== '臺股期貨' || !c[2].startsWith('外資')) continue;
     const net = num(c[13]);
     if (!Number.isFinite(net)) return null;
+    // 防呆：期交所剛開始提供資料時，欄位可能整列都是 0。外資未平倉多空方不可能同時為 0，
+    // 整列全 0 一律視為「尚未提供正式資料」，繼續等
+    const nums = c.slice(3, 15).map(num);
+    if (nums.some((n) => !Number.isFinite(n))) return null;
+    if (nums.every((n) => n === 0)) return null;
+    if (num(c[9]) === 0 && num(c[11]) === 0) return null;
     return { foreignNet: net, long: num(c[9]), short: num(c[11]) };
   }
   return null;
