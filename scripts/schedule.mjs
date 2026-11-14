@@ -21,6 +21,10 @@ export const INFER_CLOSED_AT = 16 * 60;
 // 超過這個時間仍未取得正式資料，就以即時行情值為準、不再追。
 export const INDEX_CONFIRM_UNTIL = 18 * 60;
 
+// 當日開始輪詢的最早時間（台北時間 13:00）。
+// 13:00 之前（包含凌晨、清晨、上午開盤前）絕不進行常駐輪詢，若因排程延遲喚醒會直接退出
+export const POLLING_START = 13 * 60;
+
 // 當日最後輪詢時間（23:55）。過了就不再抓，避免輪詢跨日
 export const DAY_END = 23 * 60 + 55;
 
@@ -84,11 +88,11 @@ export function dueTasks(state, now = new Date()) {
 
 /**
  * 今天「還沒抓齊」的項目（不論開始時間是否已到）。
- * 回傳空陣列＝今天沒事了（非交易日／全部抓齊／已過當日輪詢截止時間），常駐輪詢可以結束。
+ * 回傳空陣列＝今天沒事了（非交易日／13:00 前非盤後時段／全部抓齊／已過 23:55），常駐輪詢可以結束。
  */
 export function remainingTasks(state, now = new Date()) {
   const { date: today, minutes } = taipeiParts(now);
-  if (!isTradingDay(today, state.closedDates) || minutes >= DAY_END) return [];
+  if (!isTradingDay(today, state.closedDates) || minutes < POLLING_START || minutes >= DAY_END) return [];
   return TASKS.filter((t) => !isDone(t, state, today, minutes));
 }
 

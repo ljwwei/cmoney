@@ -307,7 +307,14 @@ async function main() {
   else console.log('無資料變動。');
 
   // 今天還有項目沒抓齊 → 通知 workflow 的常駐輪詢稍後再跑
-  if (!backfill && remainingTasks(state, new Date()).length) process.exitCode = 10;
+  if (!backfill) {
+    const remaining = remainingTasks(state, new Date());
+    if (remaining.length) {
+      process.exitCode = 10;
+    } else if (minutes < 13 * 60) {
+      console.log('目前尚未到盤後時段（13:00 前），不啟動常駐輪詢，直接退出。');
+    }
+  }
 }
 
 async function finish(state, nowIso) {

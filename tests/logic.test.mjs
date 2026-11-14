@@ -77,7 +77,9 @@ test('remainingTasks：今天還沒抓齊的項目（不論開始時間），供
   s.institutional.stage = 'with_block';
   s.margin = { date: day };
   assert.deepEqual(remainingTasks(s, tpe('2026-11-10T21:00:00')), []);
-  // 非交易日、跨過當日截止時間 → 沒事了
+  // 非交易日、13:00 前非盤後時段（例如凌晨/上午）、跨過當日截止時間 → 沒事了，不啟動輪詢
+  assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T04:16:00')), []);
+  assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T12:59:00')), []);
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-14T15:00:00')), []);
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T23:55:00')), []);
 });

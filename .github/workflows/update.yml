@@ -77,10 +77,13 @@ jobs:
             exit 0
           fi
 
-          # 08:30 休市日行事曆檢查：只跑一輪
-          if [ "$EVENT_SCHEDULE" = "30 0 * * 1-5" ]; then
+          # 台北時間 13:00 之前（例如凌晨排程延遲、08:30 行事曆檢查、上午誤觸發）：
+          # 只做單次檢查（更新休市日行事曆），絕不進入常駐輪詢迴圈，避免非盤後時段空轉
+          HOUR=$(TZ=Asia/Taipei date +%H)
+          if [ "$HOUR" -lt 13 ]; then
             node scripts/fetch.mjs || true
             commit_and_push
+            echo "目前為台北時間 $HOUR 時，尚未到盤後時段（13:00 前），單次檢查後直接退出。"
             exit 0
           fi
 
