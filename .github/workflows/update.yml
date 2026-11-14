@@ -13,14 +13,6 @@ on:
     paths:
       - 'scripts/**'
       - '.github/workflows/update.yml'
-  schedule:
-    # GitHub cron 使用 UTC；台北時間 = UTC+8。
-    # 主力排程已由 Cloudflare Workers Cron 精準喚醒（平日 13:25–21:25 每小時 25 分）。
-    # 此處保留 GitHub 內建排程作為離線備援（Fallback），避免歷史紀錄被頻繁洗版：
-    # 1. 台北 08:30：更新證交所休市日行事曆（颱風等臨時休市通常早上公告），只跑一輪
-    - cron: '30 0 * * 1-5'
-    # 2. 台北 13:30、14:30、20:30：三大關鍵時段備援喚醒（大盤、法人/期貨、含鉅額/融資）
-    - cron: '30 5,6,12 * * 1-5'
   workflow_dispatch:
     inputs:
       date:
