@@ -27,6 +27,7 @@ import {
   parseMargin,
   parseMisIndex,
   parseOpenApiIndexHist,
+  parseTwseIndexHist,
 } from './parsers.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -88,24 +89,74 @@ async function fetchIndexMis(date) {
   return v ? { status: 'ok', value: v } : { status: 'nodata' };
 }
 
+async function fetchIndexHistRwd(date) {
+  const json = await getJson(
+    `https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?date=${ymd(date)}&response=json&_=${Date.now()}`,
+  );
+  const v = parseTwseIndexHist(json, date);
+  return v ? { status: 'ok', value: v } : { status: 'nodata' };
+}
+
 async function fetchIndexOpenApi(date) {
   const list = await getJson('https://openapi.twse.com.tw/v1/indicesReport/MI_5MINS_HIST');
   const v = parseOpenApiIndexHist(list, date);
   return v ? { status: 'ok', value: v } : { status: 'nodata' };
 }
 
+function attachOhlc(base, ...sources) {
+  const result = { ...base };
+  for (const src of sources) {
+    if (!src) continue;
+    if (!(result.open > 0) && src.open > 0) result.open = src.open;
+    if (!(result.high > 0) && src.high > 0) result.high = src.high;
+    if (!(result.low > 0) && src.low > 0) result.low = src.low;
+  }
+  return result;
+}
+
 /**
  * 回傳 { status: 'ok', value, source } 或 { status: 'nodata', certain }。
- * certain = 兩個主要來源都「正常回應、但確定沒有今日資料」（用於判斷臨時休市；網路錯誤不算）。
+ * certain = 主要來源都「正常回應、但確定沒有今日資料」（用於判斷臨時休市；網路錯誤不算）。
+ * 一併取得開盤、最高、最低（優先由 MI_5MINS_HIST，其次由 mis 補齊）。
  */
 async function fetchIndex(date) {
-  const [twse, mis] = await Promise.allSettled([fetchIndexTwse(date), fetchIndexMis(date)]);
+  const [twse, mis, histRwd] = await Promise.allSettled([
+    fetchIndexTwse(date),
+    fetchIndexMis(date),
+    fetchIndexHistRwd(date),
+  ]);
   const ok = (r) => r.status === 'fulfilled' && r.value.status === 'ok';
-  for (const [name, r] of [['MI_INDEX', twse], ['mis', mis]]) {
+  const val = (r) => (ok(r) ? r.value.value : null);
+
+  for (const [name, r] of [['MI_INDEX', twse], ['mis', mis], ['MI_5MINS_HIST', histRwd]]) {
     if (r.status === 'rejected') console.warn(`加權指數來源 ${name} 失敗：${r.reason?.message ?? r.reason}`);
   }
-  if (ok(twse)) return { status: 'ok', value: twse.value.value, source: 'twse' };
-  if (ok(mis)) return { status: 'ok', value: mis.value.value, source: 'mis' };
+
+  let base = null;
+  let source = null;
+  if (ok(twse)) {
+    base = val(twse);
+    source = 'twse';
+  } else if (ok(mis)) {
+    base = val(mis);
+    source = 'mis';
+  } else if (ok(histRwd)) {
+    base = val(histRwd);
+    source = 'twse';
+  }
+
+  if (base) {
+    let enriched = attachOhlc(base, val(histRwd), val(mis));
+    if (!(enriched.open > 0 && enriched.high > 0 && enriched.low > 0)) {
+      try {
+        const oa = await fetchIndexOpenApi(date);
+        if (oa.status === 'ok') enriched = attachOhlc(enriched, oa.value);
+      } catch (e) {
+        console.warn(`加權指數補充 OpenAPI OHLC 失敗：${e.message}`);
+      }
+    }
+    return { status: 'ok', value: enriched, source };
+  }
 
   try {
     const r = await fetchIndexOpenApi(date);
@@ -113,8 +164,13 @@ async function fetchIndex(date) {
   } catch (e) {
     console.warn(`加權指數來源 OpenAPI 失敗：${e.message}`);
   }
-  if (twse.status === 'rejected' && mis.status === 'rejected') throw twse.reason;
-  return { status: 'nodata', certain: twse.status === 'fulfilled' && mis.status === 'fulfilled' };
+  if (twse.status === 'rejected' && mis.status === 'rejected' && histRwd.status === 'rejected') {
+    throw twse.reason;
+  }
+  return {
+    status: 'nodata',
+    certain: twse.status === 'fulfilled' && mis.status === 'fulfilled' && histRwd.status === 'fulfilled',
+  };
 }
 
 async function fetchInstitutional(date) {
@@ -161,7 +217,9 @@ async function refreshHolidays(state, today) {
     const fresh = parseHolidays(list);
     if (fresh.length) {
       state.closedDates = [...new Set([...(state.closedDates ?? []), ...fresh])].sort();
-      state.meta.holidaysCheckedOn = today;
+      if (!state.meta.holidaysCheckedOn || today > state.meta.holidaysCheckedOn) {
+        state.meta.holidaysCheckedOn = today;
+      }
     }
   } catch (e) {
     console.warn(`休市日行事曆更新失敗：${e.message}`);
@@ -225,6 +283,14 @@ async function main() {
   }
 
   const due = dueTasks(state, now);
+  if (
+    backfill &&
+    !due.includes('index') &&
+    state.index?.date === today &&
+    !(state.index.open > 0 && state.index.high > 0 && state.index.low > 0)
+  ) {
+    due.push('index');
+  }
   console.log(`${today} ${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')} 待抓取：${due.join(', ') || '（無）'}`);
 
   // 1) 加權指數（同時負責偵測臨時休市）
@@ -232,7 +298,7 @@ async function main() {
     try {
       const r = await fetchIndex(today);
       if (r.status === 'ok') {
-        let { close, change, changePct } = r.value;
+        let { close, change, changePct, open, high, low } = r.value;
         // 證交所若未提供漲跌，改用前一個交易日收盤價自行計算
         if (change == null || changePct == null) {
           const prev = state.index;
@@ -241,7 +307,20 @@ async function main() {
             changePct = +((change / prev.close) * 100).toFixed(2);
           }
         }
-        changed = apply(state, 'index', today, { close, change, changePct }, nowIso, { source: r.source }) || changed;
+        const payload = {
+          close,
+          change,
+          changePct,
+          ...(open > 0 ? { open } : {}),
+          ...(high > 0 ? { high } : {}),
+          ...(low > 0 ? { low } : {}),
+        };
+        const hasOhlc = payload.open > 0 && payload.high > 0 && payload.low > 0;
+        changed =
+          apply(state, 'index', today, payload, nowIso, {
+            source: r.source,
+            ...(r.source !== 'mis' && !hasOhlc ? { ohlcPending: true } : {}),
+          }) || changed;
         // 若這天先前被誤判為臨時休市，現在有資料就撤銷
         if (state.inferredClosed.includes(today)) {
           state.inferredClosed = state.inferredClosed.filter((d) => d !== today);

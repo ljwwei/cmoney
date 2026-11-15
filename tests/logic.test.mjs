@@ -9,6 +9,7 @@ import {
   parseInstitutional,
   parseMisIndex,
   parseOpenApiIndexHist,
+  parseTwseIndexHist,
 } from '../scripts/parsers.mjs';
 
 // 以台北時間建立 Date
@@ -129,7 +130,17 @@ test('加權指數漲跌正負號', () => {
   assert.deepEqual(parseIndex(mk('green', '-')), { close: 42711.92, change: -1050.22, changePct: -2.52 });
 });
 
-import { isPending, marginYi, marginDiffYi, toYiSigned } from '../js/app.js';
+import {
+  isPending,
+  marginYi,
+  marginDiffYi,
+  toYiSigned,
+  resolveLiveApiUrl,
+  inIntradayWindow,
+  selectIndexDisplay,
+  renderIndex,
+  indexBadge,
+} from '../js/app.js';
 
 test('尚未揭露：交易日且資料日期早於今天才顯示', () => {
   const closed = ['2026-11-12'];
@@ -191,4 +202,282 @@ test('防呆：三大法人／融資全 0 視為無資料', () => {
   };
   assert.equal(parseInstitutional(inst), null);
   assert.equal(parseMargin({ stat: 'OK', tables: [{ data: [['融資金額(仟元)', '0', '0', '0', '0', '0']] }] }), null);
+});
+
+test('盤後解析擴充 OHLC：parseMisIndex / parseTwseIndexHist / parseOpenApiIndexHist', () => {
+  const mis = {
+    msgArray: [{ d: '20261113', t: '13:33:00', z: '43675.12', y: '43091.87', o: '43719.75', h: '44489.48', l: '43534.12' }],
+  };
+  assert.deepEqual(parseMisIndex(mis, '2026-11-13'), {
+    close: 43675.12,
+    change: 583.25,
+    changePct: 1.35,
+    open: 43719.75,
+    high: 44489.48,
+    low: 43534.12,
+  });
+
+  const histRwd = {
+    stat: 'OK',
+    data: [
+      ['115/11/12', '44,180.46', '44,525.24', '42,943.50', '43,091.87'],
+      ['115/11/13', '43,719.75', '44,489.48', '43,534.12', '43,675.12'],
+    ],
+  };
+  assert.deepEqual(parseTwseIndexHist(histRwd, '2026-11-13'), {
+    close: 43675.12,
+    change: 583.25,
+    changePct: 1.35,
+    open: 43719.75,
+    high: 44489.48,
+    low: 43534.12,
+  });
+
+  const oa = [
+    { Date: '1151112', OpeningIndex: '44180.46', HighestIndex: '44525.24', LowestIndex: '42943.50', ClosingIndex: '43091.87' },
+    { Date: '1151113', OpeningIndex: '43719.75', HighestIndex: '44489.48', LowestIndex: '43534.12', ClosingIndex: '43675.12' },
+  ];
+  assert.deepEqual(parseOpenApiIndexHist(oa, '2026-11-13'), {
+    close: 43675.12,
+    change: 583.25,
+    changePct: 1.35,
+    open: 43719.75,
+    high: 44489.48,
+    low: 43534.12,
+  });
+});
+
+test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', () => {
+  assert.equal(resolveLiveApiUrl({ metaContent: 'https://cmoney-taiex.example.workers.dev/' }), 'https://cmoney-taiex.example.workers.dev/api/taiex');
+  assert.equal(resolveLiveApiUrl({ search: '?liveApi=https://demo.workers.dev/api/taiex', metaContent: 'https://other.workers.dev' }), 'https://demo.workers.dev/api/taiex');
+  assert.equal(resolveLiveApiUrl({ search: '?liveApi=javascript:alert(1)' }), '');
+  assert.equal(resolveLiveApiUrl({ search: '?liveApi=http://evil.example' }), '');
+  assert.equal(resolveLiveApiUrl({ globalApi: 'http://localhost:8787' }), 'http://localhost:8787/api/taiex');
+
+  assert.equal(inIntradayWindow('2026-11-13', '08:58:59', []), false);
+  assert.equal(inIntradayWindow('2026-11-13', '09:05:10', []), true);
+  assert.equal(inIntradayWindow('2026-11-13', '13:35:00', []), true);
+  assert.equal(inIntradayWindow('2026-11-13', '13:35:01', []), false);
+  assert.equal(inIntradayWindow('2026-11-13', '10:00:00', ['2026-11-13']), false); // 休市日
+  assert.equal(inIntradayWindow('2026-11-15', '10:00:00', []), false); // 週日
+
+  const prev = { date: '2026-11-12', close: 43091.87, change: -100, source: 'twse' };
+  const live = {
+    date: '2026-11-13',
+    time: '10:15:30',
+    close: 43800.5,
+    open: 43719.75,
+    high: 44489.48,
+    low: 43000.0,
+    prevClose: 43091.87,
+    change: 708.63,
+    changePct: 1.64,
+    marketPhase: 'intraday',
+    source: 'mis',
+    fetchedAt: '2026-11-13T02:15:31Z',
+  };
+  const settled = {
+    date: '2026-11-13',
+    close: 43675.12,
+    open: 43719.75,
+    high: 44489.48,
+    low: 43534.12,
+    change: 583.25,
+    changePct: 1.35,
+    source: 'twse',
+    fetchedAt: '2026-11-13T05:46:25Z',
+  };
+
+  assert.equal(selectIndexDisplay(prev, live, '2026-11-13'), live);
+  assert.equal(selectIndexDisplay(settled, live, '2026-11-13'), settled);
+  assert.equal(selectIndexDisplay(prev, { ...live, date: '2026-11-12' }, '2026-11-13'), prev);
+
+  const liveHtml = renderIndex(live);
+  assert.ok(liveHtml.includes('開盤') && liveHtml.includes('43,719.75'));
+  assert.ok(liveHtml.includes('最高') && liveHtml.includes('44,489.48'));
+  assert.ok(liveHtml.includes('最低') && liveHtml.includes('43,000.00'));
+  assert.ok(liveHtml.includes('ohlc__val down') && liveHtml.includes('ohlc__val up'));
+  assert.ok(liveHtml.includes('證交所盤中即時行情'));
+
+  const closedHtml = renderIndex(settled);
+  assert.ok(closedHtml.includes('開盤') && closedHtml.includes('43,719.75'));
+  assert.ok(closedHtml.includes('最高') && closedHtml.includes('44,489.48'));
+  assert.ok(closedHtml.includes('最低') && closedHtml.includes('43,534.12'));
+
+  assert.ok(indexBadge(live, '2026-11-13').includes('盤中即時'));
+  assert.ok(indexBadge({ ...live, marketPhase: 'closed', source: 'mis' }, '2026-11-13').includes('即時終盤'));
+  assert.ok(indexBadge(settled, '2026-11-13').includes('已收盤'));
+  assert.equal(indexBadge(prev, '2026-11-13'), '');
+});
+
+import worker, { parseMisLive, parseYahooLive, isWorkerIntradayWindow } from '../worker/worker.js';
+
+test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與陳舊快取保護', async () => {
+  // 1. 解析純函式驗證
+  assert.equal(parseMisLive({ msgArray: [{ d: '20261113', t: '09:00:00', z: '-', y: '43091.87' }] }), null);
+  const parsedMis = parseMisLive({
+    msgArray: [{ d: '20261113', t: '09:30:15', z: '43500.5', y: '43091.87', o: '43400', h: '43600', l: '43350' }],
+  });
+  assert.equal(parsedMis.marketPhase, 'intraday');
+  assert.equal(parsedMis.open, 43400);
+  assert.equal(parsedMis.change, 408.63);
+
+  const parsedYahoo = parseYahooLive({
+    chart: {
+      result: [
+        {
+          meta: {
+            regularMarketPrice: 43675.12,
+            previousClose: 43091.9,
+            regularMarketTime: 1794547995, // 2026-11-13 13:33:15 +08:00
+            regularMarketDayHigh: 44489.48,
+            regularMarketDayLow: 43534.12,
+          },
+          indicators: { quote: [{ open: [null, 43719.75] }] },
+        },
+      ],
+    },
+  });
+  assert.equal(parsedYahoo.date, '2026-11-13');
+  assert.equal(parsedYahoo.open, 43719.75);
+  assert.equal(parsedYahoo.source, 'yahoo');
+
+  assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T10:00:00')), true);
+  assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T13:36:00')), false);
+  assert.equal(isWorkerIntradayWindow(tpe('2026-11-15T10:00:00')), false);
+
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+
+  const cacheStore = new Map();
+  globalThis.caches = {
+    default: {
+      async match(key) {
+        const hit = cacheStore.get(String(key));
+        return hit ? hit.clone() : undefined;
+      },
+      async put(key, res) {
+        cacheStore.set(String(key), res.clone());
+      },
+    },
+  };
+
+  let upstreamCalls = 0;
+  let mode = 'mis_ok';
+
+  globalThis.fetch = async (url) => {
+    upstreamCalls += 1;
+    const u = String(url);
+    if (u.includes('mis.twse.com.tw')) {
+      if (mode === 'mis_403' || mode === 'all_fail') {
+        return new Response('Forbidden', { status: 403 });
+      }
+      return new Response(
+        JSON.stringify({
+          msgArray: [{ d: '20261113', t: '10:20:00', z: '43800', y: '43091.87', o: '43719.75', h: '43900', l: '43600' }],
+        }),
+        { status: 200 },
+      );
+    }
+    if (u.includes('query1.finance.yahoo.com')) {
+      if (mode === 'all_fail') return new Response('Err', { status: 503 });
+      return new Response(
+        JSON.stringify({
+          chart: {
+            result: [
+              {
+                meta: {
+                  regularMarketPrice: 43810,
+                  previousClose: 43091.87,
+                  regularMarketTime: 1794536400, // 2026-11-13 10:20:00 +08:00
+                  regularMarketDayHigh: 43900,
+                  regularMarketDayLow: 43600,
+                },
+                indicators: { quote: [{ open: [43719.75] }] },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    throw new Error('Unexpected fetch url: ' + u);
+  };
+
+  try {
+    // CORS preflight
+    const preflightAllowed = await worker.fetch(
+      new Request('https://taiex.example/api/taiex', {
+        method: 'OPTIONS',
+        headers: { Origin: 'https://ljwwei.github.io' },
+      }),
+      {},
+    );
+    assert.equal(preflightAllowed.status, 204);
+    assert.equal(preflightAllowed.headers.get('Access-Control-Allow-Origin'), 'https://ljwwei.github.io');
+
+    const preflightDenied = await worker.fetch(
+      new Request('https://taiex.example/api/taiex', {
+        method: 'OPTIONS',
+        headers: { Origin: 'https://untrusted.example' },
+      }),
+      {},
+    );
+    assert.equal(preflightDenied.headers.get('Access-Control-Allow-Origin'), null);
+
+    // Health check
+    const healthRes = await worker.fetch(new Request('https://taiex.example/health'), {});
+    assert.equal(healthRes.status, 200);
+    assert.equal((await healthRes.json()).ok, true);
+
+    // Primary MIS fetch + Edge Cache hit deduplication (cross-origin Safe)
+    const r1 = await worker.fetch(
+      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
+      {},
+    );
+    assert.equal(r1.status, 200);
+    const j1 = await r1.json();
+    assert.equal(j1.source, 'mis');
+    assert.equal(j1.close, 43800);
+    assert.equal(upstreamCalls, 1);
+
+    const r2 = await worker.fetch(
+      new Request('https://taiex.example/api/taiex?t=cachebust', { headers: { Origin: 'http://localhost:8080' } }),
+      {},
+    );
+    assert.equal(r2.status, 200);
+    assert.equal(r2.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
+    assert.equal(upstreamCalls, 1, 'Cache API hit must reuse edge cache even with query string / different allowed origin');
+
+    // Clear live cache -> simulate TWSE MIS 403 -> auto fallback to Yahoo ^TWII
+    cacheStore.delete('https://cache.cmoney.local/api/taiex');
+    mode = 'mis_403';
+    const r3 = await worker.fetch(
+      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
+      {},
+    );
+    assert.equal(r3.status, 200);
+    const j3 = await r3.json();
+    assert.equal(j3.source, 'yahoo');
+    assert.equal(j3.close, 43810);
+
+    // Clear live cache -> simulate both upstreams failing -> return stale cache gracefully
+    cacheStore.delete('https://cache.cmoney.local/api/taiex');
+    mode = 'all_fail';
+    const r4 = await worker.fetch(
+      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
+      {},
+    );
+    assert.equal(r4.status, 200);
+    const j4 = await r4.json();
+    assert.equal(j4.stale, true);
+
+    // No stale cache either -> 502
+    cacheStore.clear();
+    const r5 = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    assert.equal(r5.status, 502);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
 });

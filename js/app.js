@@ -3,6 +3,48 @@
 const TZ = 'Asia/Taipei';
 const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
+// 若已部署 worker/worker.js，可於 index.html 的 <meta name="taiex-api" content="..."> 或此處填入 Worker 網址
+const DEFAULT_LIVE_API = '';
+const LIVE_POLL_MS = 10 * 1000;
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function isSafeHttpOrigin(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  try {
+    const u = new URL(s);
+    const isHttps = u.protocol === 'https:';
+    const isLocalHttp = u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1');
+    if (!isHttps && !isLocalHttp) return '';
+    return s.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+export function resolveLiveApiUrl({
+  globalApi = typeof globalThis !== 'undefined' ? globalThis.CMONEY_TAIEX_API : '',
+  search = typeof location !== 'undefined' ? location.search : '',
+  metaContent = typeof document !== 'undefined'
+    ? document.querySelector?.('meta[name="taiex-api"]')?.getAttribute?.('content') ?? ''
+    : '',
+  defaultApi = DEFAULT_LIVE_API,
+} = {}) {
+  const fromQuery = search ? new URLSearchParams(search).get('liveApi') || '' : '';
+  const candidate = [fromQuery, globalApi, metaContent, defaultApi]
+    .map((v) => isSafeHttpOrigin(v))
+    .find(Boolean);
+  if (!candidate) return '';
+  return candidate.endsWith('/api/taiex') ? candidate : `${candidate}/api/taiex`;
+}
+
 // ---------- 時間 / 交易日 ----------
 
 export function taipeiNow(now = new Date()) {
@@ -39,6 +81,40 @@ export function isTradingDay(dateStr, closedDates = []) {
  */
 export function isPending(dataDate, today, closedDates) {
   return isTradingDay(today, closedDates) && (!dataDate || dataDate < today);
+}
+
+/** 台北時間交易日 08:59:00 ～ 13:35:00：啟用大盤盤中 10 秒即時輪詢 */
+export function inIntradayWindow(dateStr, timeStr, closedDates = []) {
+  return isTradingDay(dateStr, closedDates) && timeStr >= '08:59:00' && timeStr <= '13:35:00';
+}
+
+/**
+ * 決定大盤卡片此刻應顯示哪份資料：
+ * 1. 若盤後正式資料（twse / openapi）已就緒於今日 → 優先顯示盤後正式資料
+ * 2. 若盤中即時 Worker 資料屬於今日 → 顯示盤中（或剛收盤之即時終盤），並補齊開高低
+ * 3. 否則顯示前一交易日資料
+ */
+export function selectIndexDisplay(stateIndex, liveIndex, today) {
+  if (stateIndex?.date === today && stateIndex.source && stateIndex.source !== 'mis') {
+    return stateIndex;
+  }
+  if (liveIndex?.date === today) {
+    if (
+      stateIndex?.date === today &&
+      stateIndex.fetchedAt &&
+      liveIndex.fetchedAt &&
+      stateIndex.fetchedAt > liveIndex.fetchedAt
+    ) {
+      return {
+        ...stateIndex,
+        ...(stateIndex.open > 0 ? {} : liveIndex.open > 0 ? { open: liveIndex.open } : {}),
+        ...(stateIndex.high > 0 ? {} : liveIndex.high > 0 ? { high: liveIndex.high } : {}),
+        ...(stateIndex.low > 0 ? {} : liveIndex.low > 0 ? { low: liveIndex.low } : {}),
+      };
+    }
+    return liveIndex;
+  }
+  return stateIndex;
 }
 
 // ---------- 格式化 ----------
@@ -81,22 +157,72 @@ export const marginDiffYi = (today, prev) => +((today - prev) / 1e5).toFixed(1);
 
 // ---------- 各卡片內容 ----------
 
-function renderIndex(d) {
+export function renderIndex(d) {
   const cls = dirClass(d.change ?? 0);
   const arrow = d.change > 0 ? '▲' : d.change < 0 ? '▼' : '—';
   const pts = d.change == null ? '—' : `${sgn(d.change)}${fmt(Math.abs(d.change), 2)}`;
   const pct = d.changePct == null ? '—' : `${sgn(d.changePct)}${fmt(Math.abs(d.changePct), 2)}%`;
+
+  const prevClose =
+    d.prevClose > 0
+      ? d.prevClose
+      : d.change != null
+        ? +(Number(d.close) - Number(d.change)).toFixed(2)
+        : null;
+  const ohlcCls = (v) => (v > 0 && prevClose > 0 ? dirClass(v - prevClose) : 'flat');
+  const hasOhlc = d.open > 0 || d.high > 0 || d.low > 0;
+  const ohlcHtml = hasOhlc
+    ? `
+      <div class="index__ohlc" aria-label="當日開盤最高最低">
+        <div class="ohlc__item">
+          <span class="ohlc__label">開盤</span>
+          <span class="ohlc__val ${ohlcCls(d.open)}">${d.open > 0 ? fmt(d.open, 2) : '—'}</span>
+        </div>
+        <div class="ohlc__item">
+          <span class="ohlc__label">最高</span>
+          <span class="ohlc__val ${ohlcCls(d.high)}">${d.high > 0 ? fmt(d.high, 2) : '—'}</span>
+        </div>
+        <div class="ohlc__item">
+          <span class="ohlc__label">最低</span>
+          <span class="ohlc__val ${ohlcCls(d.low)}">${d.low > 0 ? fmt(d.low, 2) : '—'}</span>
+        </div>
+      </div>`
+    : '';
+
+  let subNote = '';
+  if (d.marketPhase === 'intraday') {
+    if (d.stale) subNote = '（即時連線重試中，暫顯示最近一筆快取）';
+    else if (d.source === 'yahoo') subNote = '（Yahoo Finance 盤中即時備援）';
+    else subNote = '（證交所盤中即時行情）';
+  } else if (d.source === 'mis') {
+    subNote = '<br>暫用證交所即時行情終盤值，稍後以盤後正式資料確認';
+  } else if (d.source === 'yahoo') {
+    subNote = '<br>暫用 Yahoo Finance 終盤值，稍後以盤後正式資料確認';
+  }
+
   return `
-    <div class="index ${cls}">
-      <div class="index__close">${fmt(d.close, 2)}</div>
-      <div class="index__chg">
-        <span class="chip ${cls}"><span class="arrow">${arrow}</span> ${pts}</span>
-        <span class="chip ${cls}">${pct}</span>
+    <div class="index__wrap">
+      <div class="index ${cls}">
+        <div class="index__close">${fmt(d.close, 2)}</div>
+        <div class="index__chg">
+          <span class="chip ${cls}"><span class="arrow">${arrow}</span> ${pts}</span>
+          <span class="chip ${cls}">${pct}</span>
+        </div>
       </div>
+      ${ohlcHtml}
     </div>
-    <p class="sub">較前一交易日收盤${
-      d.source === 'mis' ? '<br>暫用證交所即時行情終盤值，稍後以盤後正式資料確認' : ''
-    }</p>`;
+    <p class="sub">較前一交易日收盤${subNote}</p>`;
+}
+
+export function indexBadge(d, today) {
+  if (!d || d.date !== today) return '';
+  if (d.marketPhase === 'intraday') {
+    return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>盤中即時</span>';
+  }
+  if (d.source === 'mis' || d.source === 'yahoo') {
+    return '<span class="badge badge--temp">即時終盤</span>';
+  }
+  return '<span class="badge badge--closed">已收盤</span>';
 }
 
 function renderInst(d) {
@@ -162,28 +288,32 @@ function renderMargin(d) {
 // ---------- 渲染 ----------
 
 const CARDS = [
-  { id: 'card-index', key: 'index', render: renderIndex },
+  { id: 'card-index', key: 'index', render: renderIndex, badge: indexBadge },
   { id: 'card-inst', key: 'institutional', render: renderInst, badge: instBadge },
   { id: 'card-fut', key: 'futures', render: renderFut },
   { id: 'card-margin', key: 'margin', render: renderMargin },
 ];
 
-function renderCard(card, state, today) {
+function renderCard(card, state, today, liveIndex) {
   const el = document.getElementById(card.id);
-  const d = state?.[card.key];
+  const d = card.key === 'index' ? selectIndexDisplay(state?.index, liveIndex, today) : state?.[card.key];
   const body = el.querySelector('.card__body');
   const notice = el.querySelector('.notice');
   const foot = el.querySelector('.card__foot');
-  el.querySelector('.badge-slot').innerHTML = d && card.badge ? card.badge(d) : '';
+  el.querySelector('.badge-slot').innerHTML = d && card.badge ? card.badge(d, today) : '';
 
   if (!d) {
     body.innerHTML = '<p class="empty">尚無資料</p>';
     foot.textContent = '';
   } else {
     body.innerHTML = card.render(d);
-    foot.innerHTML = `<span>資料日期 <b>${fmtDate(d.date)}</b></span><span>${
-      d.fetchedAt ? `擷取 ${fmtTime(d.fetchedAt)}` : ''
-    }</span>`;
+    const timeText =
+      card.key === 'index' && d.date === today && d.time
+        ? `報價 ${escapeHtml(d.time)}`
+        : d.fetchedAt
+          ? `擷取 ${fmtTime(d.fetchedAt)}`
+          : '';
+    foot.innerHTML = `<span>資料日期 <b>${fmtDate(d.date)}</b></span><span>${timeText}</span>`;
   }
 
   // 每個資訊各自判斷：交易日且尚未取得當日資料 → 顯示「當日資訊尚未揭露」
@@ -205,19 +335,26 @@ function renderCard(card, state, today) {
 }
 
 let state = null;
+let liveState = null;
 let lastSig = '';
 
 export function renderAll() {
   const { date: today, time } = taipeiNow();
   document.getElementById('clock').textContent = time;
   if (!state) return;
-  // 只有「日期變了」或「資料變了」才重畫卡片（避免每秒重繪）
-  const sig = `${today}|${state.meta?.updatedAt}`;
+  // 只有「日期變了」或「盤後／盤中資料變了」才重畫卡片（避免每秒重繪）
+  const liveSig = liveState
+    ? `${liveState.date}|${liveState.time}|${liveState.close}|${liveState.stale ? 1 : 0}|${liveState.fetchedAt}`
+    : '';
+  const sig = `${today}|${state.meta?.updatedAt}|${liveSig}`;
   if (sig === lastSig) return;
   lastSig = sig;
-  for (const c of CARDS) renderCard(c, state, today);
-  document.getElementById('meta-updated').textContent = state.meta?.updatedAt
-    ? `資料更新：${fmtTime(state.meta.updatedAt)}（台北時間）`
+  for (const c of CARDS) renderCard(c, state, today, liveState);
+  const candidates = [state.meta?.updatedAt];
+  if (liveState?.date === today && liveState.fetchedAt) candidates.push(liveState.fetchedAt);
+  const latestIso = candidates.filter(Boolean).sort().at(-1);
+  document.getElementById('meta-updated').textContent = latestIso
+    ? `資料更新：${fmtTime(latestIso)}（台北時間）`
     : '資料更新：—';
 }
 
@@ -257,6 +394,37 @@ async function fetchGithubApi() {
 
 const newer = (a, b) => ((a?.meta?.updatedAt ?? '') >= (b?.meta?.updatedAt ?? '') ? a : b);
 
+let liveInFlight = false;
+
+async function loadLive() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+  const endpoint = resolveLiveApiUrl();
+  if (!endpoint || liveInFlight || !state) return;
+
+  const { date: today, time } = taipeiNow();
+  const forceLive =
+    typeof location !== 'undefined' && new URLSearchParams(location.search).get('forceLive') === '1';
+  if (!forceLive) {
+    if (!inIntradayWindow(today, time, state.closedDates ?? [])) return;
+    if (state.index?.date === today && state.index.source && state.index.source !== 'mis') return;
+  }
+
+  liveInFlight = true;
+  try {
+    const res = await fetch(endpoint, { cache: 'no-store' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (json?.ok && json.close > 0) {
+      liveState = json;
+      renderAll();
+    }
+  } catch (e) {
+    console.warn('讀取盤中即時大盤失敗', e?.message ?? e);
+  } finally {
+    liveInFlight = false;
+  }
+}
+
 async function load() {
   if (typeof document !== 'undefined' && document.hidden && state) return; // 分頁在背景時不更新
   const [pages, api] = await Promise.allSettled([fetchPages(), fetchGithubApi()]);
@@ -272,13 +440,18 @@ async function load() {
     }
   }
   renderAll();
+  loadLive();
 }
 
 if (typeof document !== 'undefined') {
   load();
-  setInterval(load, 30 * 1000); // 每 30 秒取得最新資料
+  setInterval(load, 30 * 1000); // 每 30 秒同步盤後資料 / 行事曆
+  setInterval(loadLive, LIVE_POLL_MS); // 交易日盤中每 10 秒取得大盤即時指數
   setInterval(renderAll, 1000); // 每秒更新時鐘；跨過 00:00 時自動切換「尚未揭露」狀態
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) load();
+    if (!document.hidden) {
+      load();
+      loadLive();
+    }
   });
 }

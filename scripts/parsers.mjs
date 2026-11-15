@@ -33,7 +33,7 @@ export function parseIndex(json) {
 
 /**
  * 證交所即時行情 mis getStockInfo（ex_ch=tse_t00.tw，加權指數）。
- * 13:30 收盤後，最後一筆（t ≥ 13:30:00）即為終盤指數；y 為前一交易日收盤。
+ * 13:30 收盤後，最後一筆（t ≥ 13:30:00）即為終盤指數；y 為前一交易日收盤；o/h/l 為開盤/最高/最低。
  * 回傳 null 代表：不是指定日期的資料、尚未收盤、或欄位缺漏。
  * @param {object} json mis 回傳
  * @param {string} date YYYY-MM-DD
@@ -45,8 +45,47 @@ export function parseMisIndex(json, date) {
   const close = num(item.z);
   const prev = num(item.y);
   if (!Number.isFinite(close) || !Number.isFinite(prev) || prev <= 0) return null;
+  const open = num(item.o);
+  const high = num(item.h);
+  const low = num(item.l);
   const change = +(close - prev).toFixed(2);
-  return { close, change, changePct: +((change / prev) * 100).toFixed(2) };
+  return {
+    close,
+    change,
+    changePct: +((change / prev) * 100).toFixed(2),
+    ...(open > 0 ? { open } : {}),
+    ...(high > 0 ? { high } : {}),
+    ...(low > 0 ? { low } : {}),
+  };
+}
+
+/**
+ * 證交所盤後日統計 /indicesReport/MI_5MINS_HIST（含單日開盤、最高、最低、收盤指數）。
+ * 支援依指定日期回溯歷史或當日收盤 OHLC。
+ */
+export function parseTwseIndexHist(json, date) {
+  if (!json || json.stat !== 'OK' || !Array.isArray(json.data)) return null;
+  const rocSlash = `${Number(date.slice(0, 4)) - 1911}/${date.slice(5, 7)}/${date.slice(8, 10)}`;
+  const idx = json.data.findIndex((r) => String(r[0] ?? '').trim() === rocSlash);
+  if (idx < 0) return null;
+  const row = json.data[idx];
+  const open = num(row[1]);
+  const high = num(row[2]);
+  const low = num(row[3]);
+  const close = num(row[4]);
+  if (!Number.isFinite(close) || close <= 0) return null;
+  const prevRow = idx > 0 ? json.data[idx - 1] : null;
+  const prev = prevRow ? num(prevRow[4]) : NaN;
+  const change = Number.isFinite(prev) && prev > 0 ? +(close - prev).toFixed(2) : null;
+  const changePct = change != null ? +((change / prev) * 100).toFixed(2) : null;
+  return {
+    close,
+    change,
+    changePct,
+    ...(open > 0 ? { open } : {}),
+    ...(high > 0 ? { high } : {}),
+    ...(low > 0 ? { low } : {}),
+  };
 }
 
 /**
@@ -57,16 +96,27 @@ export function parseOpenApiIndexHist(list, date) {
   if (!Array.isArray(list)) return null;
   const roc = (d) => `${Number(d.slice(0, 4)) - 1911}${d.slice(5, 7)}${d.slice(8, 10)}`;
   const rows = list
-    .map((r) => ({ date: String(r.Date ?? '').trim(), close: num(r.ClosingIndex) }))
+    .map((r) => ({
+      date: String(r.Date ?? '').trim(),
+      open: num(r.OpeningIndex),
+      high: num(r.HighestIndex),
+      low: num(r.LowestIndex),
+      close: num(r.ClosingIndex),
+    }))
     .filter((r) => r.date && Number.isFinite(r.close))
     .sort((a, b) => a.date.localeCompare(b.date));
   const i = rows.findIndex((r) => r.date === roc(date));
   if (i < 0) return null;
-  const close = rows[i].close;
-  if (i === 0) return { close, change: null, changePct: null };
+  const { close, open, high, low } = rows[i];
+  const ohlc = {
+    ...(open > 0 ? { open } : {}),
+    ...(high > 0 ? { high } : {}),
+    ...(low > 0 ? { low } : {}),
+  };
+  if (i === 0) return { close, change: null, changePct: null, ...ohlc };
   const prev = rows[i - 1].close;
   const change = +(close - prev).toFixed(2);
-  return { close, change, changePct: +((change / prev) * 100).toFixed(2) };
+  return { close, change, changePct: +((change / prev) * 100).toFixed(2), ...ohlc };
 }
 
 /**

@@ -1,10 +1,10 @@
 # 台股資訊 cmoney
 
-每日台股盤後資訊網站（純靜態頁 + GitHub Actions 定時抓取），電腦版與手機版各自優化排版。
+台股盤中即時大盤 + 每日盤後資訊網站（純靜態頁 + GitHub Actions 定時抓取 + 可選 Cloudflare Worker 盤中即時代理），電腦版與手機版各自優化排版。
 
 | 資訊 | 來源 | 規則 |
 |---|---|---|
-| 加權指數 | 證交所 `MI_INDEX` | 收盤、漲跌點數、漲跌幅% 直接取自證交所；若缺漏則以前一交易日收盤自行計算。紅漲綠跌 |
+| 加權指數 | 盤中：Cloudflare Worker 代理證交所 MIS `tse_t00.tw`（Yahoo `^TWII` 備援）<br>盤後：證交所 `MI_INDEX` + `MI_5MINS_HIST` | 盤中每 10 秒即時更新（開盤、最高、最低、最新指數與漲跌）；盤後取正式收盤與開高低，若缺漏則以前一交易日收盤自行計算。紅漲綠跌 |
 | 三大法人買賣超 | 證交所 `BFI82U` | 外資、投信、自營商（自行買賣＋避險）買賣超金額（億）。買超紅、賣超綠。標註「不含鉅額 / 含鉅額」 |
 | 外資台股期貨未平倉 | 期交所「三大法人-區分各期貨契約」CSV | 外資及陸資・臺股期貨・未平倉多空淨額，取絕對值顯示口數（−103473 → 103,473 口 淨空單） |
 | 融資餘額 | 證交所 `MI_MARGN` | 融資金額今日餘額（仟元）→ 億（四捨五入），並與「前日餘額」比較顯示增減（億，1 位小數） |
@@ -53,12 +53,19 @@
 ```
 index.html, css/style.css, js/app.js   前端（RWD：手機 <600px、平板、電腦 ≥960px 各自排版）
 data/data.json                         抓取結果（由 Actions 自動 commit）
-scripts/fetch.mjs                      抓取主程式
+scripts/fetch.mjs                      盤後抓取主程式
 scripts/schedule.mjs                   排程／交易日判斷（純函式）
 scripts/parsers.mjs                    各來源解析
-.github/workflows/update.yml           定時排程
+worker/worker.js                       Cloudflare Worker 盤中大盤即時代理（含 8 秒 Edge Cache + 雙備援）
+.github/workflows/update.yml           盤後定時排程
 tests/logic.test.mjs                   單元測試（node --test tests/）
 ```
+
+## 啟用盤中即時大盤（Cloudflare Worker）
+1. 將 [worker/worker.js](worker/worker.js) 貼上並部署到 Cloudflare Worker（如 `cmoney-taiex`；可選擇與原本的 Cron Trigger 共用同支 Worker）。
+2. 將部署好的 Worker 網址填入 [index.html](index.html) 的 `<meta name="taiex-api" content="https://你的worker.workers.dev" />` 並推上 GitHub。
+3. 交易日台北時間 `08:59 ~ 13:35` 開啟官網時會自動每 10 秒向 Worker 取得即時加權指數（分頁切至背景自動暫停）；盤後正式資料產出後自動切回靜態 `data/data.json`。
+   - 測試期也可免改程式，直接在網址後方加上 `?liveApi=https://你的worker.workers.dev&forceLive=1` 立即測試連線。
 
 ## 部署
 1. 推到 GitHub 後：**Settings → Pages → Build and deployment → Deploy from a branch → `main` / `(root)`**。

@@ -145,6 +145,9 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 .chip.down { background: var(--down-bg); }
 
 .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.75rem;
   font-weight: 700;
   padding: 3px 10px;
@@ -154,11 +157,44 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 }
 .badge--block { color: #6ea8ff; }
 .badge--noblock { color: var(--warn); }
+.badge--live { color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
+.badge--temp { color: var(--warn); background: var(--warn-bg); }
+.badge--closed { color: var(--muted); border-color: var(--card-border); }
+
+@media (prefers-color-scheme: light) {
+  .badge--live { color: #0284c7; background: rgba(2, 132, 199, 0.1); }
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-live 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
 
 /* ====== 加權指數 ====== */
+.index__wrap { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px 32px; flex-wrap: wrap; }
 .index { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
 .index__close { font-size: 4rem; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 .index__chg { display: flex; gap: 10px; flex-wrap: wrap; font-size: 1.25rem; padding-bottom: 6px; }
+.index__ohlc {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(92px, 1fr));
+  gap: 8px 18px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--card-border);
+}
+.ohlc__item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ohlc__label { font-size: 0.72rem; color: var(--muted); font-weight: 600; letter-spacing: 0.04em; }
+.ohlc__val { font-size: 1.05rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 /* ====== 三大法人 ====== */
 .inst { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
@@ -230,10 +266,14 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   .card { padding: 16px 16px 12px; border-radius: 14px; }
   .card__head { margin-bottom: 10px; }
 
-  /* 大盤：數字置中放大，漲跌並排 */
+  /* 大盤：數字置中放大，漲跌並排，開高低滿寬三欄 */
+  .index__wrap { flex-direction: column; align-items: stretch; gap: 12px; }
   .index { flex-direction: column; align-items: flex-start; gap: 10px; }
   .index__close { font-size: 2.9rem; }
   .index__chg { font-size: 1.05rem; padding-bottom: 0; }
+  .index__ohlc { grid-template-columns: repeat(3, 1fr); gap: 6px 8px; padding: 8px 12px; }
+  .ohlc__label { font-size: 0.7rem; }
+  .ohlc__val { font-size: 0.94rem; }
 
   /* 三大法人：改成清單列，隱藏長條，買賣明細折到下一行 */
   .inst { gap: 0; }
