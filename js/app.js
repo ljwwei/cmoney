@@ -117,6 +117,17 @@ export function selectIndexDisplay(stateIndex, liveIndex, today) {
   return stateIndex;
 }
 
+export function acceptLiveQuote(current, incoming) {
+  if (!incoming || incoming.ok === false || !(incoming.close > 0)) return current;
+  if (!current) return incoming;
+  if (incoming.date > current.date) return incoming;
+  if (incoming.date < current.date) return current;
+  if (incoming.time && current.time && incoming.time < current.time && !current.stale) {
+    return { ...current, fetchedAt: incoming.fetchedAt || current.fetchedAt };
+  }
+  return incoming;
+}
+
 // ---------- 格式化 ----------
 
 const fmt = (n, d = 0) =>
@@ -131,7 +142,7 @@ export const fmtDate = (d) => {
   return `${y}/${m}/${day}（${WEEK[dow]}）`;
 };
 
-const fmtTime = (iso) => {
+const fmtTime = (iso, withSec = false) => {
   if (!iso) return '';
   return new Intl.DateTimeFormat('zh-TW', {
     timeZone: TZ,
@@ -140,6 +151,7 @@ const fmtTime = (iso) => {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    ...(withSec ? { second: '2-digit' } : {}),
   }).format(new Date(iso));
 };
 
@@ -192,12 +204,14 @@ export function renderIndex(d) {
   let subNote = '';
   if (d.marketPhase === 'intraday') {
     if (d.stale) subNote = '（即時連線重試中，暫顯示最近一筆快取）';
+    else if (d.source === 'yahoo_tw') subNote = '（Yahoo 奇摩股市盤中即時）';
+    else if (d.source === 'cnyes') subNote = '（鉅亨網盤中即時）';
     else if (d.source === 'yahoo') subNote = '（Yahoo Finance 盤中即時備援）';
     else subNote = '（證交所盤中即時行情）';
   } else if (d.source === 'mis') {
     subNote = '<br>暫用證交所即時行情終盤值，稍後以盤後正式資料確認';
-  } else if (d.source === 'yahoo') {
-    subNote = '<br>暫用 Yahoo Finance 終盤值，稍後以盤後正式資料確認';
+  } else if (d.source === 'yahoo' || d.source === 'yahoo_tw' || d.source === 'cnyes') {
+    subNote = '<br>暫用即時行情終盤值，稍後以盤後正式資料確認';
   }
 
   return `
@@ -219,7 +233,7 @@ export function indexBadge(d, today) {
   if (d.marketPhase === 'intraday') {
     return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>盤中即時</span>';
   }
-  if (d.source === 'mis' || d.source === 'yahoo') {
+  if (d.source === 'mis' || d.source === 'yahoo' || d.source === 'yahoo_tw' || d.source === 'cnyes') {
     return '<span class="badge badge--temp">即時終盤</span>';
   }
   return '<span class="badge badge--closed">已收盤</span>';
@@ -353,8 +367,9 @@ export function renderAll() {
   const candidates = [state.meta?.updatedAt];
   if (liveState?.date === today && liveState.fetchedAt) candidates.push(liveState.fetchedAt);
   const latestIso = candidates.filter(Boolean).sort().at(-1);
+  const showSec = Boolean(liveState?.date === today && latestIso === liveState.fetchedAt);
   document.getElementById('meta-updated').textContent = latestIso
-    ? `資料更新：${fmtTime(latestIso)}（台北時間）`
+    ? `資料更新：${fmtTime(latestIso, showSec)}（台北時間）`
     : '資料更新：—';
 }
 
@@ -414,8 +429,9 @@ async function loadLive() {
     const res = await fetch(endpoint, { cache: 'no-store' });
     if (!res.ok) return;
     const json = await res.json();
-    if (json?.ok && json.close > 0) {
-      liveState = json;
+    const next = acceptLiveQuote(liveState, json);
+    if (next && next !== liveState) {
+      liveState = next;
       renderAll();
     }
   } catch (e) {

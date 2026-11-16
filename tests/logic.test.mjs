@@ -140,6 +140,7 @@ import {
   selectIndexDisplay,
   renderIndex,
   indexBadge,
+  acceptLiveQuote,
 } from '../js/app.js';
 
 test('尚未揭露：交易日且資料日期早於今天才顯示', () => {
@@ -305,14 +306,37 @@ test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', ()
   assert.ok(closedHtml.includes('最低') && closedHtml.includes('43,534.12'));
 
   assert.ok(indexBadge(live, '2026-11-13').includes('盤中即時'));
+  assert.ok(indexBadge({ ...live, source: 'yahoo_tw' }, '2026-11-13').includes('盤中即時'));
   assert.ok(indexBadge({ ...live, marketPhase: 'closed', source: 'mis' }, '2026-11-13').includes('即時終盤'));
   assert.ok(indexBadge(settled, '2026-11-13').includes('已收盤'));
   assert.equal(indexBadge(prev, '2026-11-13'), '');
+
+  const ytwHtml = renderIndex({ ...live, source: 'yahoo_tw' });
+  assert.ok(ytwHtml.includes('Yahoo 奇摩股市盤中即時'));
+  const cnyesHtml = renderIndex({ ...live, source: 'cnyes' });
+  assert.ok(cnyesHtml.includes('鉅亨網盤中即時'));
+
+  // 時間戳只往新不往回退，但同一日較舊快取仍可更新 fetchedAt
+  assert.equal(acceptLiveQuote(null, live), live);
+  assert.equal(acceptLiveQuote(live, { ...live, date: '2026-11-12' }), live);
+  const olderSameDay = acceptLiveQuote(live, { ...live, time: '10:15:10', close: 43750, fetchedAt: '2026-11-13T02:15:40Z' });
+  assert.equal(olderSameDay.close, 43800.5);
+  assert.equal(olderSameDay.time, '10:15:30');
+  assert.equal(olderSameDay.fetchedAt, '2026-11-13T02:15:40Z');
+  const newerTick = acceptLiveQuote(live, { ...live, time: '10:15:40', close: 43820 });
+  assert.equal(newerTick.close, 43820);
 });
 
-import worker, { parseMisLive, parseYahooLive, isWorkerIntradayWindow } from '../worker/worker.js';
+import worker, {
+  parseMisLive,
+  parseYahooTwLive,
+  parseCnyesLive,
+  parseYahooLive,
+  pickFreshestQuote,
+  isWorkerIntradayWindow,
+} from '../worker/worker.js';
 
-test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與陳舊快取保護', async () => {
+test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層備援與陳舊快取保護', async () => {
   // 1. 解析純函式驗證
   assert.equal(parseMisLive({ msgArray: [{ d: '20261113', t: '09:00:00', z: '-', y: '43091.87' }] }), null);
   const parsedMis = parseMisLive({
@@ -321,6 +345,35 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
   assert.equal(parsedMis.marketPhase, 'intraday');
   assert.equal(parsedMis.open, 43400);
   assert.equal(parsedMis.change, 408.63);
+
+  const parsedYtw = parseYahooTwLive([
+    {
+      chart: {
+        meta: { regularMarketTime: 1794792060, regularMarketPrice: 42693.3, previousClose: 43675.12 }, // 2026-11-16 09:21:00
+        quote: {
+          price: '42693.30',
+          previousClose: '43675.12',
+          openPrice: '43512.42',
+          dayHighPrice: '43512.42',
+          dayLowPrice: '42595.92',
+          marketStatus: 'open',
+          refreshedTs: '2026-11-16T01:20:55Z', // 09:20:55 +08:00
+        },
+      },
+    },
+  ]);
+  assert.equal(parsedYtw.date, '2026-11-16');
+  assert.equal(parsedYtw.time, '09:20:55');
+  assert.equal(parsedYtw.close, 42693.3);
+  assert.equal(parsedYtw.open, 43512.42);
+  assert.equal(parsedYtw.source, 'yahoo_tw');
+
+  const parsedCnyes = parseCnyesLive({
+    data: [{ 6: 42768.12, 12: 43512.42, 13: 42595.92, 19: 43512.42, 21: 43675.12, 200007: 1794791930 }],
+  });
+  assert.equal(parsedCnyes.date, '2026-11-16');
+  assert.equal(parsedCnyes.time, '09:18:50');
+  assert.equal(parsedCnyes.source, 'cnyes');
 
   const parsedYahoo = parseYahooLive({
     chart: {
@@ -341,6 +394,13 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
   assert.equal(parsedYahoo.date, '2026-11-13');
   assert.equal(parsedYahoo.open, 43719.75);
   assert.equal(parsedYahoo.source, 'yahoo');
+
+  // 競速排序：較新時間優先，同分秒以官方 MIS 優先
+  const misLag = { ok: true, date: '2026-11-16', time: '09:20:00', close: 42775, source: 'mis' };
+  const ytwFresh = { ok: true, date: '2026-11-16', time: '09:20:55', close: 42693, source: 'yahoo_tw' };
+  assert.equal(pickFreshestQuote([misLag, ytwFresh]).source, 'yahoo_tw');
+  const misTie = { ok: true, date: '2026-11-16', time: '09:20:55', close: 42693, source: 'mis' };
+  assert.equal(pickFreshestQuote([ytwFresh, misTie]).source, 'mis');
 
   assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T10:00:00')), true);
   assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T13:36:00')), false);
@@ -363,13 +423,46 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
   };
 
   let upstreamCalls = 0;
-  let mode = 'mis_ok';
+  let mode = 'ytw_freshest';
 
   globalThis.fetch = async (url) => {
     upstreamCalls += 1;
     const u = String(url);
+    if (u.includes('tw.stock.yahoo.com')) {
+      if (mode !== 'ytw_freshest') return new Response('Err', { status: 503 });
+      return new Response(
+        JSON.stringify([
+          {
+            chart: {
+              meta: { regularMarketTime: 1794536460, regularMarketPrice: 43888, previousClose: 43091.87 }, // 2026-11-13 10:21:00
+              quote: {
+                price: '43888',
+                previousClose: '43091.87',
+                openPrice: '43719.75',
+                dayHighPrice: '43920',
+                dayLowPrice: '43600',
+                marketStatus: 'open',
+                refreshedTs: '2026-11-13T02:20:55Z', // 10:20:55
+              },
+            },
+          },
+        ]),
+        { status: 200 },
+      );
+    }
+    if (u.includes('ws.api.cnyes.com')) {
+      if (mode === 'mis_only' || mode === 'yahoo_backup' || mode === 'all_fail') {
+        return new Response('Err', { status: 503 });
+      }
+      return new Response(
+        JSON.stringify({
+          data: [{ 6: 43850, 12: 43900, 13: 43600, 19: 43719.75, 21: 43091.87, 200007: 1794536430 }], // 10:20:30
+        }),
+        { status: 200 },
+      );
+    }
     if (u.includes('mis.twse.com.tw')) {
-      if (mode === 'mis_403' || mode === 'all_fail') {
+      if (mode === 'yahoo_backup' || mode === 'all_fail') {
         return new Response('Forbidden', { status: 403 });
       }
       return new Response(
@@ -430,16 +523,18 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
     assert.equal(healthRes.status, 200);
     assert.equal((await healthRes.json()).ok, true);
 
-    // Primary MIS fetch + Edge Cache hit deduplication (cross-origin Safe)
+    // 搶鮮挑選時間最新的 yahoo_tw (10:20:55 勝過 mis 10:20:00)，且不讓瀏覽器自行快取
     const r1 = await worker.fetch(
       new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
       {},
     );
     assert.equal(r1.status, 200);
+    assert.match(r1.headers.get('Cache-Control') || '', /no-store/);
     const j1 = await r1.json();
-    assert.equal(j1.source, 'mis');
-    assert.equal(j1.close, 43800);
-    assert.equal(upstreamCalls, 1);
+    assert.equal(j1.source, 'yahoo_tw');
+    assert.equal(j1.time, '10:20:55');
+    assert.equal(j1.close, 43888);
+    assert.equal(upstreamCalls, 3);
 
     const r2 = await worker.fetch(
       new Request('https://taiex.example/api/taiex?t=cachebust', { headers: { Origin: 'http://localhost:8080' } }),
@@ -447,11 +542,23 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
     );
     assert.equal(r2.status, 200);
     assert.equal(r2.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
-    assert.equal(upstreamCalls, 1, 'Cache API hit must reuse edge cache even with query string / different allowed origin');
+    assert.equal(upstreamCalls, 3, 'Cache API hit must reuse edge cache across allowed origins');
 
-    // Clear live cache -> simulate TWSE MIS 403 -> auto fallback to Yahoo ^TWII
-    cacheStore.delete('https://cache.cmoney.local/api/taiex');
-    mode = 'mis_403';
+    // Yahoo TW 失敗 -> Cnyes (10:20:30) 自動補上搶鮮
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'cnyes_freshest';
+    const rCnyes = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    assert.equal((await rCnyes.json()).source, 'cnyes');
+
+    // Yahoo TW & Cnyes 失敗 -> MIS (10:20:00) 正常接手
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'mis_only';
+    const rMis = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    assert.equal((await rMis.json()).source, 'mis');
+
+    // 前三者全失敗 -> Yahoo 全域備援
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'yahoo_backup';
     const r3 = await worker.fetch(
       new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
       {},
@@ -461,8 +568,8 @@ test('Cloudflare Worker：盤中解析、Cache API 去重、MIS->Yahoo 備援與
     assert.equal(j3.source, 'yahoo');
     assert.equal(j3.close, 43810);
 
-    // Clear live cache -> simulate both upstreams failing -> return stale cache gracefully
-    cacheStore.delete('https://cache.cmoney.local/api/taiex');
+    // Clear live cache -> simulate all upstreams failing -> return stale cache gracefully
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
     mode = 'all_fail';
     const r4 = await worker.fetch(
       new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
