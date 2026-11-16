@@ -1,7 +1,7 @@
 {
   "meta": {
     "holidaysCheckedOn": "2026-11-16",
-    "updatedAt": "2026-11-16T05:34:05.682Z"
+    "updatedAt": "2026-11-16T05:46:31.565Z"
   },
   "closedDates": [
     "2026-01-01",
@@ -64,8 +64,8 @@
     "open": 43512.42,
     "high": 43512.42,
     "low": 41040.08,
-    "source": "mis",
-    "fetchedAt": "2026-11-16T05:34:05.682Z"
+    "source": "twse",
+    "fetchedAt": "2026-11-16T05:46:31.565Z"
   },
   "futures": {
     "date": "2026-11-13",
