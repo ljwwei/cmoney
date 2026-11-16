@@ -14,11 +14,20 @@ const YAHOO_TWII_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/%5ETWI
 const CACHE_KEY_LIVE = 'https://cache.cmoney.local/api/taiex-v2';
 const CACHE_KEY_STALE = 'https://cache.cmoney.local/api/taiex-stale-v2';
 
-const INTRADAY_TTL_SEC = 5; // 每 5 秒刷新一次邊緣快取，確保前端每 10 秒輪詢必拿到新快照
+const INTRADAY_TTL_SEC = 2; // 盤中共享快取 s-maxage = 2 秒（台股 5 秒撮合一次，前端每 2.5 秒輪詢）
 const OFFHOURS_TTL_SEC = 60;
 const STALE_TTL_SEC = 600;
-const UPSTREAM_TIMEOUT_MS = 3000;
-const MIS_TIMEOUT_MS = 1500; // MIS 尖峰易逾時或快取卡住，限 1.5 秒免拖慢 Yahoo/鉅亨即時回應
+const UPSTREAM_TIMEOUT_MS = 800; // 三個上游一律 0.8 秒極速超時，慢來源直接跳過，不拖累時間差
+
+/** 盤中 2 秒、非盤中 60 秒的共享快取秒數 */
+export function cacheTtlFor(now = new Date()) {
+  return isWorkerIntradayWindow(now) ? INTRADAY_TTL_SEC : OFFHOURS_TTL_SEC;
+}
+
+/** 在 URL 尾端加上防快取時間戳（自動判斷用 ? 或 &），確保不吃到上游 CDN 幾秒前的舊快取 */
+export function withCacheBuster(url, ts = Date.now()) {
+  return `${url}${String(url).includes('?') ? '&' : '?'}_=${ts}`;
+}
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -270,42 +279,52 @@ export function buildCorsHeaders(request, env) {
   return headers;
 }
 
-function jsonResponse(payload, status, request, env) {
+const NO_STORE = 'no-store, no-cache, must-revalidate';
+
+function jsonResponse(payload, status, request, env, cacheControl = NO_STORE) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store, no-cache, must-revalidate',
+      'Cache-Control': cacheControl,
       ...buildCorsHeaders(request, env),
     },
   });
 }
 
-async function fetchJsonWithTimeout(url, headers = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
-  const res = await fetch(url, {
-    headers,
+/** 成功的即時報價：瀏覽器不留存（max-age=0），共享快取（Cloudflare）最多 s-maxage 秒 */
+const liveCacheControl = (ttl) => `public, max-age=0, s-maxage=${ttl}`;
+
+/**
+ * 所有上游請求的唯一出口：
+ *  1. URL 尾端加防快取時間戳 `_=${Date.now()}`
+ *  2. cf: { cacheTtl: 0, cacheEverything: false } 禁止 Cloudflare 出站快取
+ *  3. 請求標頭 Cache-Control: no-cache（再加 Pragma）
+ *  4. AbortSignal.timeout(800)：超過 0.8 秒直接放棄該來源
+ */
+async function fetchJsonWithTimeout(url, headers = {}) {
+  const res = await fetch(withCacheBuster(url), {
+    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache', ...headers },
     cf: { cacheTtl: 0, cacheEverything: false },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
 async function fetchLiveFromUpstreams(nowIso) {
-  const ts = Date.now();
+  // 三源同時並發；任何一家超過 0.8 秒或失敗都不會拖累其他來源，最後取「成交時間最新」的一筆
   const [yahooTwRes, cnyesRes, misRes] = await Promise.allSettled([
-    fetchJsonWithTimeout(`${YAHOO_TW_URL}?_=${ts}`, {
+    fetchJsonWithTimeout(YAHOO_TW_URL, {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
       Accept: 'application/json',
-      'Cache-Control': 'no-cache',
     }),
-    fetchJsonWithTimeout(`${CNYES_TWSE_URL}?_=${ts}`, {
+    fetchJsonWithTimeout(CNYES_TWSE_URL, {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
       Accept: 'application/json',
       Referer: 'https://invest.cnyes.com/',
-      'Cache-Control': 'no-cache',
     }),
-    fetchJsonWithTimeout(`${TWSE_MIS_URL}&_=${ts}`, BROWSER_HEADERS, MIS_TIMEOUT_MS),
+    fetchJsonWithTimeout(TWSE_MIS_URL, BROWSER_HEADERS),
   ]);
 
   const candidates = [];
@@ -351,48 +370,64 @@ function getEdgeCache() {
   return typeof caches !== 'undefined' && caches?.default ? caches.default : null;
 }
 
+function writeLiveCache(edgeCache, fresh, ttl) {
+  const body = JSON.stringify(fresh);
+  const mk = (cacheControl) =>
+    new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': cacheControl } });
+  return Promise.all([
+    edgeCache.put(CACHE_KEY_LIVE, mk(`public, max-age=${ttl}, s-maxage=${ttl}`)),
+    edgeCache.put(CACHE_KEY_STALE, mk(`public, max-age=${STALE_TTL_SEC}`)),
+  ]);
+}
+
+// 同一個 isolate 內，快取過期瞬間湧入的多個請求共用「同一輪」上游抓取，不會各打一輪三家 API
+let inflightRefresh = null;
+
+function refreshLive(edgeCache, ttl, ctx) {
+  if (inflightRefresh) return inflightRefresh;
+
+  const task = (async () => {
+    const fresh = await fetchLiveFromUpstreams(new Date().toISOString());
+    if (fresh && edgeCache) {
+      const writes = writeLiveCache(edgeCache, fresh, ttl).catch((err) =>
+        console.warn('Edge cache put failed:', err?.message ?? err),
+      );
+      if (ctx?.waitUntil) ctx.waitUntil(writes);
+      else await writes;
+    }
+    return fresh;
+  })();
+
+  const tracked = task.finally(() => {
+    if (inflightRefresh === tracked) inflightRefresh = null;
+  });
+  inflightRefresh = tracked;
+  // 即使第一個觸發的訪客提前斷線，這一輪上游抓取仍會跑完，讓其他等待者拿到結果
+  if (ctx?.waitUntil) ctx.waitUntil(tracked.catch(() => {}));
+  return tracked;
+}
+
 async function handleTaiex(request, env, ctx) {
-  const ttl = isWorkerIntradayWindow() ? INTRADAY_TTL_SEC : OFFHOURS_TTL_SEC;
+  const ttl = cacheTtlFor();
   const edgeCache = getEdgeCache();
 
   if (edgeCache) {
     const cached = await edgeCache.match(CACHE_KEY_LIVE);
     if (cached) {
       const data = await cached.json();
-      return jsonResponse(data, 200, request, env);
+      return jsonResponse(data, 200, request, env, liveCacheControl(ttl));
     }
   }
 
-  const nowIso = new Date().toISOString();
-  const fresh = await fetchLiveFromUpstreams(nowIso);
+  let fresh = null;
+  try {
+    fresh = await refreshLive(edgeCache, ttl, ctx);
+  } catch (err) {
+    console.warn('Live refresh failed:', err?.message ?? err);
+  }
 
   if (fresh) {
-    if (edgeCache) {
-      const putLive = edgeCache.put(
-        CACHE_KEY_LIVE,
-        new Response(JSON.stringify(fresh), {
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': `public, max-age=${ttl}`,
-          },
-        }),
-      );
-      const putStale = edgeCache.put(
-        CACHE_KEY_STALE,
-        new Response(JSON.stringify(fresh), {
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': `public, max-age=${STALE_TTL_SEC}`,
-          },
-        }),
-      );
-      if (ctx?.waitUntil) {
-        ctx.waitUntil(Promise.all([putLive, putStale]));
-      } else {
-        await Promise.all([putLive, putStale]);
-      }
-    }
-    return jsonResponse(fresh, 200, request, env);
+    return jsonResponse(fresh, 200, request, env, liveCacheControl(ttl));
   }
 
   if (edgeCache) {
@@ -431,7 +466,7 @@ export default {
       );
     }
 
-    if (url.pathname === '/' || url.pathname === '/api/taiex') {
+    if (url.pathname === '/' || url.pathname === '/api/taiex' || url.pathname === '/api/quote') {
       return handleTaiex(request, env, ctx);
     }
 

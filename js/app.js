@@ -5,7 +5,55 @@ const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
 // 若已部署 worker/worker.js，可於 index.html 的 <meta name="taiex-api" content="..."> 或此處填入 Worker 網址
 const DEFAULT_LIVE_API = '';
-const LIVE_POLL_MS = 10 * 1000;
+// 台股盤中每 5 秒撮合一次；以 2.5 秒輪詢（比撮合週期更密）才不會錯過剛出爐的報價
+export const LIVE_POLL_MS = 2500;
+
+/**
+ * 遞迴 setTimeout 輪詢器（不是 setInterval）：
+ *  - 一定等「上一次請求結束」後才開始倒數下一次，不會請求堆疊
+ *  - 分頁隱藏即暫停；切回時立刻抓一次並恢復固定間隔
+ */
+export function createLivePoller({
+  run,
+  isHidden = () => false,
+  intervalMs = LIVE_POLL_MS,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  let timer = null;
+  let running = false;
+
+  function schedule(delay = intervalMs) {
+    clearTimer(timer);
+    timer = null;
+    if (isHidden()) return;
+    timer = setTimer(async () => {
+      timer = null;
+      if (running || isHidden()) return; // 前一輪仍在進行：交給它結束後自行排程
+      running = true;
+      try {
+        await run();
+      } catch (e) {
+        console.warn('即時輪詢發生錯誤', e?.message ?? e);
+      } finally {
+        running = false;
+      }
+      schedule();
+    }, delay);
+  }
+
+  return {
+    start: () => schedule(0),
+    stop() {
+      clearTimer(timer);
+      timer = null;
+    },
+    onVisibilityChange() {
+      if (isHidden()) this.stop();
+      else schedule(0);
+    },
+  };
+}
 
 function escapeHtml(s) {
   return String(s ?? '')
@@ -83,7 +131,7 @@ export function isPending(dataDate, today, closedDates) {
   return isTradingDay(today, closedDates) && (!dataDate || dataDate < today);
 }
 
-/** 台北時間交易日 08:59:00 ～ 13:35:00：啟用大盤盤中 10 秒即時輪詢 */
+/** 台北時間交易日 08:59:00 ～ 13:35:00：啟用大盤盤中 2.5 秒即時輪詢 */
 export function inIntradayWindow(dateStr, timeStr, closedDates = []) {
   return isTradingDay(dateStr, closedDates) && timeStr >= '08:59:00' && timeStr <= '13:35:00';
 }
@@ -426,7 +474,9 @@ async function loadLive() {
 
   liveInFlight = true;
   try {
-    const res = await fetch(endpoint, { cache: 'no-store' });
+    // _t 時間戳 + no-store：不吃任何瀏覽器／中間代理的舊快取
+    const sep = endpoint.includes('?') ? '&' : '?';
+    const res = await fetch(`${endpoint}${sep}_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return;
     const json = await res.json();
     const next = acceptLiveQuote(liveState, json);
@@ -456,18 +506,27 @@ async function load() {
     }
   }
   renderAll();
-  loadLive();
+  // 第一次取得盤後資料後，啟動盤中即時輪詢（之後由 livePoller 遞迴排程，不再由 load 觸發）
+  if (!liveKicked && state) {
+    liveKicked = true;
+    livePoller?.start();
+  }
 }
 
+let livePoller = null;
+let liveKicked = false;
+
 if (typeof document !== 'undefined') {
+  livePoller = createLivePoller({ run: loadLive, isHidden: () => document.hidden });
   load();
   setInterval(load, 30 * 1000); // 每 30 秒同步盤後資料 / 行事曆
-  setInterval(loadLive, LIVE_POLL_MS); // 交易日盤中每 10 秒取得大盤即時指數
   setInterval(renderAll, 1000); // 每秒更新時鐘；跨過 00:00 時自動切換「尚未揭露」狀態
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) {
-      load();
-      loadLive();
+    if (document.hidden) {
+      livePoller.stop(); // 切到其他分頁／縮小視窗：暫停即時抓取
+    } else {
+      load(); // 切回網頁：立刻同步盤後資料，並立即抓一次即時報價、恢復 2.5 秒輪詢
+      livePoller.start();
     }
   });
 }

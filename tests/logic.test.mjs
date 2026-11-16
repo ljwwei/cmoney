@@ -141,6 +141,8 @@ import {
   renderIndex,
   indexBadge,
   acceptLiveQuote,
+  createLivePoller,
+  LIVE_POLL_MS,
 } from '../js/app.js';
 
 test('尚未揭露：交易日且資料日期早於今天才顯示', () => {
@@ -327,6 +329,96 @@ test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', ()
   assert.equal(newerTick.close, 43820);
 });
 
+test('前端即時輪詢：2.5 秒遞迴 setTimeout、請求結束才倒數、分頁隱藏暫停、切回立即抓取', async () => {
+  assert.equal(LIVE_POLL_MS, 2500);
+
+  let nextId = 1;
+  const pending = new Map();
+  const setTimer = (fn, delay) => {
+    const id = nextId++;
+    pending.set(id, { fn, delay });
+    return id;
+  };
+  const clearTimer = (id) => pending.delete(id);
+  const only = () => {
+    assert.equal(pending.size, 1, 'exactly one pending timer');
+    return [...pending.values()][0];
+  };
+  const fireNext = async () => {
+    const [id, t] = [...pending.entries()][0];
+    pending.delete(id);
+    await t.fn();
+  };
+
+  let hidden = false;
+  let runs = 0;
+  let release;
+  const poller = createLivePoller({
+    run: () => {
+      runs += 1;
+      return new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+    isHidden: () => hidden,
+    setTimer,
+    clearTimer,
+  });
+
+  // 啟動：立即（0ms）抓第一次
+  poller.start();
+  assert.equal(only().delay, 0);
+
+  // 第一次請求進行中：尚未排下一次（確保是「請求結束後才倒數」，不會堆疊）
+  const firstRun = fireNext();
+  assert.equal(runs, 1);
+  assert.equal(pending.size, 0);
+
+  // 請求結束 → 才排入 2.5 秒後的下一次
+  release();
+  await firstRun;
+  assert.equal(only().delay, 2500);
+
+  // 分頁隱藏 → 清掉計時器、停止抓取
+  hidden = true;
+  poller.onVisibilityChange();
+  assert.equal(pending.size, 0);
+
+  // 切回網頁 → 立即抓一次（0ms），之後恢復 2.5 秒間隔
+  hidden = false;
+  poller.onVisibilityChange();
+  assert.equal(only().delay, 0);
+  const secondRun = fireNext();
+  assert.equal(runs, 2);
+  release();
+  await secondRun;
+  assert.equal(only().delay, 2500);
+
+  // 請求進行中分頁被隱藏：結束後不再排程
+  const thirdRun = fireNext();
+  assert.equal(runs, 3);
+  hidden = true;
+  poller.onVisibilityChange();
+  release();
+  await thirdRun;
+  assert.equal(pending.size, 0);
+
+  // 單次請求丟出例外不會讓輪詢中斷
+  hidden = false;
+  const flaky = createLivePoller({
+    run: async () => {
+      throw new Error('boom');
+    },
+    setTimer,
+    clearTimer,
+  });
+  flaky.start();
+  await fireNext();
+  assert.equal(only().delay, 2500);
+  flaky.stop();
+  assert.equal(pending.size, 0);
+});
+
 import worker, {
   parseMisLive,
   parseYahooTwLive,
@@ -334,7 +426,17 @@ import worker, {
   parseYahooLive,
   pickFreshestQuote,
   isWorkerIntradayWindow,
+  cacheTtlFor,
+  withCacheBuster,
 } from '../worker/worker.js';
+
+test('Cloudflare Worker：防快取時間戳、0.8 秒超時、2 秒共享快取與請求合併', async () => {
+  assert.equal(withCacheBuster('https://a.example/x?y=1', 123), 'https://a.example/x?y=1&_=123');
+  assert.equal(withCacheBuster('https://a.example/x;type=tick', 456), 'https://a.example/x;type=tick?_=456');
+  assert.equal(cacheTtlFor(tpe('2026-11-16T10:00:00')), 2); // 盤中 s-maxage = 2 秒
+  assert.equal(cacheTtlFor(tpe('2026-11-16T15:00:00')), 60); // 盤後
+  assert.equal(cacheTtlFor(tpe('2026-11-15T10:00:00')), 60); // 週日
+});
 
 test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層備援與陳舊快取保護', async () => {
   // 1. 解析純函式驗證
@@ -424,12 +526,16 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
 
   let upstreamCalls = 0;
   let mode = 'ytw_freshest';
+  let delayMs = 0;
+  const upstreamLog = [];
 
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init = {}) => {
     upstreamCalls += 1;
     const u = String(url);
+    upstreamLog.push({ url: u, init });
+    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
     if (u.includes('tw.stock.yahoo.com')) {
-      if (mode !== 'ytw_freshest') return new Response('Err', { status: 503 });
+      if (mode !== 'ytw_freshest' && mode !== 'mis_hang') return new Response('Err', { status: 503 });
       return new Response(
         JSON.stringify([
           {
@@ -462,6 +568,12 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       );
     }
     if (u.includes('mis.twse.com.tw')) {
+      if (mode === 'mis_hang') {
+        // 模擬證交所掛住不回應：只有被 AbortSignal 超時中止才會結束
+        return new Promise((_, reject) => {
+          init.signal.addEventListener('abort', () => reject(init.signal.reason));
+        });
+      }
       if (mode === 'yahoo_backup' || mode === 'all_fail') {
         return new Response('Forbidden', { status: 403 });
       }
@@ -529,12 +641,45 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       {},
     );
     assert.equal(r1.status, 200);
-    assert.match(r1.headers.get('Cache-Control') || '', /no-store/);
     const j1 = await r1.json();
     assert.equal(j1.source, 'yahoo_tw');
     assert.equal(j1.time, '10:20:55');
     assert.equal(j1.close, 43888);
     assert.equal(upstreamCalls, 3);
+
+    // 三個上游請求都必須：URL 帶 _= 時間戳、cf 禁快取、Cache-Control: no-cache、有 abort signal
+    assert.equal(upstreamLog.length, 3);
+    for (const call of upstreamLog) {
+      assert.match(call.url, /[?&]_=\d{13}(?:&|$)/, `missing cache-buster: ${call.url}`);
+      assert.deepEqual(call.init.cf, { cacheTtl: 0, cacheEverything: false });
+      assert.equal(call.init.headers['Cache-Control'], 'no-cache');
+      assert.ok(call.init.signal instanceof AbortSignal);
+    }
+    assert.ok(upstreamLog.some((c) => c.url.includes('tw.stock.yahoo.com')));
+    assert.ok(upstreamLog.some((c) => c.url.includes('ws.api.cnyes.com')));
+    assert.ok(upstreamLog.some((c) => c.url.includes('mis.twse.com.tw')));
+
+    // 回應標頭：共享快取 s-maxage 與 TTL 一致（盤中 2 秒／盤後 60 秒），瀏覽器 max-age=0
+    assert.equal(r1.headers.get('Cache-Control'), `public, max-age=0, s-maxage=${cacheTtlFor()}`);
+
+    // /api/quote 為 /api/taiex 的別名；仍命中邊緣快取，不增加上游請求
+    const rQuote = await worker.fetch(new Request('https://taiex.example/api/quote?_t=1'), {});
+    assert.equal(rQuote.status, 200);
+    assert.equal((await rQuote.json()).source, 'yahoo_tw');
+    assert.equal(upstreamCalls, 3);
+
+    // 快取過期瞬間湧入 5 個請求：同一 isolate 只會合併成「一輪」三源抓取
+    cacheStore.clear();
+    delayMs = 30;
+    const beforeBurst = upstreamCalls;
+    const burst = await Promise.all(
+      Array.from({ length: 5 }, () => worker.fetch(new Request('https://taiex.example/api/taiex'), {})),
+    );
+    delayMs = 0;
+    assert.equal(upstreamCalls - beforeBurst, 3, 'concurrent misses must share one upstream round');
+    for (const res of burst) assert.equal((await res.json()).source, 'yahoo_tw');
+    upstreamLog.length = 0;
+    const callsAfterBurst = upstreamCalls;
 
     const r2 = await worker.fetch(
       new Request('https://taiex.example/api/taiex?t=cachebust', { headers: { Origin: 'http://localhost:8080' } }),
@@ -542,7 +687,7 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
     );
     assert.equal(r2.status, 200);
     assert.equal(r2.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
-    assert.equal(upstreamCalls, 3, 'Cache API hit must reuse edge cache across allowed origins');
+    assert.equal(upstreamCalls, callsAfterBurst, 'Cache API hit must reuse edge cache across allowed origins');
 
     // Yahoo TW 失敗 -> Cnyes (10:20:30) 自動補上搶鮮
     cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
@@ -555,6 +700,19 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
     mode = 'mis_only';
     const rMis = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
     assert.equal((await rMis.json()).source, 'mis');
+
+    // 證交所掛住不回應：0.8 秒超時直接略過，立刻用 Yahoo 奇摩 / 鉅亨網已取得的資料回傳（不會被拖到 1.4 秒以上）
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'mis_hang';
+    const keepAlive = setInterval(() => {}, 20); // AbortSignal.timeout 的計時器不會維持 event loop，測試需自行保活
+    const hangStart = Date.now();
+    const rHang = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    const hangElapsed = Date.now() - hangStart;
+    clearInterval(keepAlive);
+    const jHang = await rHang.json();
+    assert.equal(jHang.source, 'yahoo_tw');
+    assert.equal(jHang.time, '10:20:55');
+    assert.ok(hangElapsed >= 700 && hangElapsed < 1400, `expected ~800ms timeout, got ${hangElapsed}ms`);
 
     // 前三者全失敗 -> Yahoo 全域備援
     cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
