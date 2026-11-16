@@ -1,7 +1,7 @@
 {
   "meta": {
     "holidaysCheckedOn": "2026-11-16",
-    "updatedAt": "2026-11-16T12:00:03.675Z"
+    "updatedAt": "2026-11-16T12:39:01.329Z"
   },
   "closedDates": [
     "2026-01-01",
@@ -100,9 +100,9 @@
     "fetchedAt": "2026-11-16T12:00:03.675Z"
   },
   "margin": {
-    "date": "2026-11-13",
-    "balance": 536598938,
-    "prevBalance": 533474629,
-    "fetchedAt": "2026-11-13T12:34:42.122Z"
+    "date": "2026-11-16",
+    "balance": 524497993,
+    "prevBalance": 536598906,
+    "fetchedAt": "2026-11-16T12:39:01.329Z"
   }
 }
