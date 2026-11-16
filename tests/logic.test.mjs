@@ -529,13 +529,36 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
   let delayMs = 0;
   const upstreamLog = [];
 
+  const waitAbortable = (ms, signal) =>
+    new Promise((resolve, reject) => {
+      if (!ms) return resolve();
+      const onAbort = () => {
+        clearTimeout(t);
+        reject(signal.reason);
+      };
+      const t = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+
+  const hangOnSignal = (signal) =>
+    new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+
+  let yahooGlobalCalls = 0;
+
   globalThis.fetch = async (url, init = {}) => {
     upstreamCalls += 1;
     const u = String(url);
     upstreamLog.push({ url: u, init });
     if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
     if (u.includes('tw.stock.yahoo.com')) {
-      if (mode !== 'ytw_freshest' && mode !== 'mis_hang') return new Response('Err', { status: 503 });
+      if (mode === 'all_hang') return hangOnSignal(init.signal);
+      if (mode === 'cold_grace') await waitAbortable(920, init.signal);
+      else if (mode !== 'ytw_freshest' && mode !== 'mis_hang') return new Response('Err', { status: 503 });
       return new Response(
         JSON.stringify([
           {
@@ -557,7 +580,8 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       );
     }
     if (u.includes('ws.api.cnyes.com')) {
-      if (mode === 'mis_only' || mode === 'yahoo_backup' || mode === 'all_fail') {
+      if (mode === 'all_hang') return hangOnSignal(init.signal);
+      if (mode === 'mis_only' || mode === 'yahoo_backup' || mode === 'all_fail' || mode === 'cold_grace') {
         return new Response('Err', { status: 503 });
       }
       return new Response(
@@ -568,11 +592,9 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       );
     }
     if (u.includes('mis.twse.com.tw')) {
-      if (mode === 'mis_hang') {
+      if (mode === 'mis_hang' || mode === 'cold_grace' || mode === 'all_hang') {
         // 模擬證交所掛住不回應：只有被 AbortSignal 超時中止才會結束
-        return new Promise((_, reject) => {
-          init.signal.addEventListener('abort', () => reject(init.signal.reason));
-        });
+        return hangOnSignal(init.signal);
       }
       if (mode === 'yahoo_backup' || mode === 'all_fail') {
         return new Response('Forbidden', { status: 403 });
@@ -585,7 +607,8 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       );
     }
     if (u.includes('query1.finance.yahoo.com')) {
-      if (mode === 'all_fail') return new Response('Err', { status: 503 });
+      yahooGlobalCalls += 1;
+      if (mode === 'all_fail' || mode === 'all_hang') return new Response('Err', { status: 503 });
       return new Response(
         JSON.stringify({
           chart: {
@@ -713,6 +736,30 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
     assert.equal(jHang.source, 'yahoo_tw');
     assert.equal(jHang.time, '10:20:55');
     assert.ok(hangElapsed >= 700 && hangElapsed < 1400, `expected ~800ms timeout, got ${hangElapsed}ms`);
+
+    // 方案 1 冷啟動寬限測試：800ms 時三家皆無回傳（Cnyes 錯、MIS 掛住、Yahoo TW 于 ~920ms 回來）→ 不截斷，搶第一家回來就立刻回傳
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'cold_grace';
+    const graceStart = Date.now();
+    const rGrace = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    const graceElapsed = Date.now() - graceStart;
+    const jGrace = await rGrace.json();
+    assert.equal(rGrace.status, 200);
+    assert.equal(jGrace.source, 'yahoo_tw');
+    assert.ok(graceElapsed >= 850 && graceElapsed < 1450, `expected ~920ms grace finish, got ${graceElapsed}ms`);
+
+    // 方案 1 滿 1800ms 全掛住：直接中止且不再串行補等 Yahoo Global 800ms，立刻退回陳舊快取
+    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
+    mode = 'all_hang';
+    const ygBefore = yahooGlobalCalls;
+    const hardStart = Date.now();
+    const rHard = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
+    const hardElapsed = Date.now() - hardStart;
+    const jHard = await rHard.json();
+    assert.equal(rHard.status, 200);
+    assert.equal(jHard.stale, true);
+    assert.equal(yahooGlobalCalls, ygBefore, 'must skip sequential Yahoo Global after 1800ms hard cap');
+    assert.ok(hardElapsed >= 1700 && hardElapsed < 2300, `expected ~1800ms hard cap, got ${hardElapsed}ms`);
 
     // 前三者全失敗 -> Yahoo 全域備援
     cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');

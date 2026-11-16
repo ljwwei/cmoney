@@ -65,7 +65,7 @@ tests/logic.test.mjs                   單元測試（node --test tests/）
 1. 將 [worker/worker.js](worker/worker.js) 貼上並部署到 Cloudflare Worker（如 `cmoney-taiex`；可選擇與原本的 Cron Trigger 共用同支 Worker）。
 2. 將部署好的 Worker 網址填入 [index.html](index.html) 的 `<meta name="taiex-api" content="https://你的worker.workers.dev" />` 並推上 GitHub。
 3. 交易日台北時間 `08:59 ~ 13:35` 開啟官網時，會以遞迴 `setTimeout` 每 2.5 秒向 Worker 取得即時加權指數（上一次請求結束後才倒數；分頁切到背景自動暫停，切回立即補抓一次）；盤後正式資料產出後自動切回靜態 `data/data.json`。
-   - Worker 對上游（證交所、Yahoo 奇摩股市、鉅亨網）每個請求都帶 `_=時間戳`、`cf.cacheTtl=0`、`Cache-Control: no-cache`，並以 0.8 秒超時並發抓取；共享快取 `s-maxage=2`，同一個 Cloudflare 資料中心對上游最多每 2 秒發出一輪請求。
+   - Worker 對上游（證交所、Yahoo 奇摩股市、鉅亨網）每個請求都帶 `_=時間戳`、`cf.cacheTtl=0`、`Cache-Control: no-cache`，並採用保底競速（0.8 秒時已有任一家成功即截斷慢來源；若三家全未回則最多寬限至 1.8 秒搶第一家成功者）；共享快取 `s-maxage=2`，同一個 Cloudflare 資料中心對上游最多每 2 秒發出一輪請求。
    - 測試期也可免改程式，直接在網址後方加上 `?liveApi=https://你的worker.workers.dev&forceLive=1` 立即測試連線。
 
 ## 部署

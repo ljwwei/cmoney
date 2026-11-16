@@ -17,7 +17,8 @@ const CACHE_KEY_STALE = 'https://cache.cmoney.local/api/taiex-stale-v2';
 const INTRADAY_TTL_SEC = 2; // 盤中共享快取 s-maxage = 2 秒（台股 5 秒撮合一次，前端每 2.5 秒輪詢）
 const OFFHOURS_TTL_SEC = 60;
 const STALE_TTL_SEC = 600;
-const UPSTREAM_TIMEOUT_MS = 800; // 三個上游一律 0.8 秒極速超時，慢來源直接跳過，不拖累時間差
+const UPSTREAM_TIMEOUT_MS = 800; // 前 800ms 盡量收齊三家比對誰最新；若已有任一家成功即中止慢來源
+const UPSTREAM_GRACE_MS = 1800; // 若滿 800ms 三家全未回傳（冷啟動／開盤尖峰），最多寬限至 1800ms 搶第 1 家成功者
 
 /** 盤中 2 秒、非盤中 60 秒的共享快取秒數 */
 export function cacheTtlFor(now = new Date()) {
@@ -300,67 +301,119 @@ const liveCacheControl = (ttl) => `public, max-age=0, s-maxage=${ttl}`;
  *  1. URL 尾端加防快取時間戳 `_=${Date.now()}`
  *  2. cf: { cacheTtl: 0, cacheEverything: false } 禁止 Cloudflare 出站快取
  *  3. 請求標頭 Cache-Control: no-cache（再加 Pragma）
- *  4. AbortSignal.timeout(800)：超過 0.8 秒直接放棄該來源
+ *  4. 支援外部競速 signal（800ms 軟超時 + 1800ms 保底寬限），或預設 800ms 超時
  */
-async function fetchJsonWithTimeout(url, headers = {}) {
+async function fetchJsonWithTimeout(url, headers = {}, signal = AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)) {
   const res = await fetch(withCacheBuster(url), {
     headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache', ...headers },
     cf: { cacheTtl: 0, cacheEverything: false },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    signal,
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-async function fetchLiveFromUpstreams(nowIso) {
-  // 三源同時並發；任何一家超過 0.8 秒或失敗都不會拖累其他來源，最後取「成交時間最新」的一筆
-  const [yahooTwRes, cnyesRes, misRes] = await Promise.allSettled([
-    fetchJsonWithTimeout(YAHOO_TW_URL, {
-      'User-Agent': BROWSER_HEADERS['User-Agent'],
-      Accept: 'application/json',
-    }),
-    fetchJsonWithTimeout(CNYES_TWSE_URL, {
+const PRIMARY_SOURCES = [
+  {
+    label: 'Yahoo TW',
+    url: YAHOO_TW_URL,
+    headers: { 'User-Agent': BROWSER_HEADERS['User-Agent'], Accept: 'application/json' },
+    parse: parseYahooTwLive,
+  },
+  {
+    label: 'Cnyes',
+    url: CNYES_TWSE_URL,
+    headers: {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
       Accept: 'application/json',
       Referer: 'https://invest.cnyes.com/',
-    }),
-    fetchJsonWithTimeout(TWSE_MIS_URL, BROWSER_HEADERS),
-  ]);
+    },
+    parse: parseCnyesLive,
+  },
+  {
+    label: 'TWSE MIS',
+    url: TWSE_MIS_URL,
+    headers: BROWSER_HEADERS,
+    parse: parseMisLive,
+  },
+];
 
+/**
+ * 保底競速：
+ *  - 0～800ms：三源並發，若全部結束直接挑最新；若滿 800ms 已有任 1 家成功，立刻中止慢來源並回傳。
+ *  - 800～1800ms（僅當 800ms 時三家全未成功）：不直接放棄，搶第 1 家回傳者立即返回；滿 1800ms 才全數中止。
+ */
+export async function racePrimaryUpstreams(
+  nowIso,
+  { softTimeoutMs = UPSTREAM_TIMEOUT_MS, hardTimeoutMs = UPSTREAM_GRACE_MS } = {},
+) {
+  const controller = new AbortController();
   const candidates = [];
-  if (yahooTwRes.status === 'fulfilled') {
-    const parsed = parseYahooTwLive(yahooTwRes.value, nowIso);
-    if (parsed) candidates.push(parsed);
-  } else {
-    console.warn('Yahoo TW failed:', yahooTwRes.reason?.message ?? yahooTwRes.reason);
-  }
+  let settled = 0;
+  let softReached = false;
+  let done = false;
 
-  if (cnyesRes.status === 'fulfilled') {
-    const parsed = parseCnyesLive(cnyesRes.value, nowIso);
-    if (parsed) candidates.push(parsed);
-  } else {
-    console.warn('Cnyes failed:', cnyesRes.reason?.message ?? cnyesRes.reason);
-  }
+  return new Promise((resolve) => {
+    let softTimer = null;
+    let hardTimer = null;
 
-  if (misRes.status === 'fulfilled') {
-    const parsed = parseMisLive(misRes.value, nowIso);
-    if (parsed) candidates.push(parsed);
-  } else {
-    console.warn('TWSE MIS failed:', misRes.reason?.message ?? misRes.reason);
-  }
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(softTimer);
+      clearTimeout(hardTimer);
+      controller.abort(new DOMException('Upstream race completed', 'AbortError'));
+      resolve(pickFreshestQuote(candidates));
+    };
 
-  const best = pickFreshestQuote(candidates);
+    softTimer = setTimeout(() => {
+      softReached = true;
+      if (candidates.length > 0) finish();
+    }, softTimeoutMs);
+
+    hardTimer = setTimeout(() => {
+      finish();
+    }, hardTimeoutMs);
+
+    for (const src of PRIMARY_SOURCES) {
+      fetchJsonWithTimeout(src.url, src.headers, controller.signal)
+        .then((json) => {
+          const parsed = src.parse(json, nowIso);
+          if (parsed) {
+            candidates.push(parsed);
+            if (softReached) finish();
+          }
+        })
+        .catch((err) => {
+          if (!done && err?.name !== 'AbortError') {
+            console.warn(`${src.label} failed:`, err?.message ?? err);
+          }
+        })
+        .finally(() => {
+          settled += 1;
+          if (settled === PRIMARY_SOURCES.length) finish();
+        });
+    }
+  });
+}
+
+async function fetchLiveFromUpstreams(nowIso) {
+  const startedAt = Date.now();
+  const best = await racePrimaryUpstreams(nowIso);
   if (best) return best;
 
-  try {
-    const yahooJson = await fetchJsonWithTimeout(YAHOO_TWII_URL, {
-      'User-Agent': BROWSER_HEADERS['User-Agent'],
-      Accept: 'application/json',
-    });
-    const parsedYahoo = parseYahooLive(yahooJson, nowIso);
-    if (parsedYahoo) return parsedYahoo;
-  } catch (err) {
-    console.warn('Yahoo ^TWII failed:', err?.message ?? err);
+  // 若是三家在短時間內直接回錯誤碼（如 403/503），補試 Yahoo Global；若已耗盡 1.8 秒寬限就不重複久等
+  if (Date.now() - startedAt < 1000) {
+    try {
+      const yahooJson = await fetchJsonWithTimeout(YAHOO_TWII_URL, {
+        'User-Agent': BROWSER_HEADERS['User-Agent'],
+        Accept: 'application/json',
+      });
+      const parsedYahoo = parseYahooLive(yahooJson, nowIso);
+      if (parsedYahoo) return parsedYahoo;
+    } catch (err) {
+      console.warn('Yahoo ^TWII failed:', err?.message ?? err);
+    }
   }
 
   return null;
