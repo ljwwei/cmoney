@@ -2,9 +2,8 @@
   "name": "cmoney-taiex",
   "main": "worker/worker.js",
   "compatibility_date": "2026-11-01",
-  "vars": {
-    "FUGLE_SYMBOL": "IX0001"
-  },
+  // 保留於 Cloudflare Dashboard 設定的環境變數，避免部署時覆蓋既有設定（程式內已預設 IX0001）
+  "keep_vars": true,
   // 全站唯一一條富果 WebSocket 連線單例（Free Plan 支援 SQLite-backed Durable Objects）
   "durable_objects": {
     "bindings": [
