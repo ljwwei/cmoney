@@ -18,9 +18,13 @@
       "tag": "v1",
       "new_sqlite_classes": ["FugleHub"]
     }
+  ],
+  // 獨立 D1 資料庫（累積瀏覽總人次 site_counters 優先讀寫於此）
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cmoney-visits",
+      "database_id": "7eecf3e4-0592-403a-b4d9-6346d58e3755"
+    }
   ]
-  // 若另外建立了獨立 D1 資料庫給人數計次，可取消下方註解並填入 database_id（或於 Dashboard Bindings 綁定 DB）：
-  // "d1_databases": [
-  //   { "binding": "DB", "database_name": "cmoney", "database_id": "<你的-D1-DATABASE-ID>" }
-  // ]
 }
