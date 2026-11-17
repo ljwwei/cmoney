@@ -1,59 +1,14 @@
 // 前端顯示邏輯（純函式 + 渲染）。所有「今天」的判斷都以台北時間為準。
+// 主力走 Worker SSE（/api/stream）轉發富果 WebSocket；SSE 無法連線時退回遞迴 setTimeout 輪詢。
+// API Key 完全不經手前端，僅存於 Cloudflare Worker Secret (FUGLE_API_KEY)。
 
 const TZ = 'Asia/Taipei';
 const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 
-// 若已部署 worker/worker.js，可於 index.html 的 <meta name="taiex-api" content="..."> 或此處填入 Worker 網址
 const DEFAULT_LIVE_API = '';
-// 台股盤中每 5 秒撮合一次；以 2.5 秒輪詢（比撮合週期更密）才不會錯過剛出爐的報價
-export const LIVE_POLL_MS = 2500;
-
-/**
- * 遞迴 setTimeout 輪詢器（不是 setInterval）：
- *  - 一定等「上一次請求結束」後才開始倒數下一次，不會請求堆疊
- *  - 分頁隱藏即暫停；切回時立刻抓一次並恢復固定間隔
- */
-export function createLivePoller({
-  run,
-  isHidden = () => false,
-  intervalMs = LIVE_POLL_MS,
-  setTimer = setTimeout,
-  clearTimer = clearTimeout,
-} = {}) {
-  let timer = null;
-  let running = false;
-
-  function schedule(delay = intervalMs) {
-    clearTimer(timer);
-    timer = null;
-    if (isHidden()) return;
-    timer = setTimer(async () => {
-      timer = null;
-      if (running || isHidden()) return; // 前一輪仍在進行：交給它結束後自行排程
-      running = true;
-      try {
-        await run();
-      } catch (e) {
-        console.warn('即時輪詢發生錯誤', e?.message ?? e);
-      } finally {
-        running = false;
-      }
-      schedule();
-    }, delay);
-  }
-
-  return {
-    start: () => schedule(0),
-    stop() {
-      clearTimer(timer);
-      timer = null;
-    },
-    onVisibilityChange() {
-      if (isHidden()) this.stop();
-      else schedule(0);
-    },
-  };
-}
+export const FALLBACK_POLL_MS = 2500;
+export const STREAM_RETRY_MS = 15000;
+export const FETCH_TIMEOUT_MS = 2000;
 
 function escapeHtml(s) {
   return String(s ?? '')
@@ -77,7 +32,7 @@ function isSafeHttpOrigin(raw) {
   }
 }
 
-export function resolveLiveApiUrl({
+export function resolveApiOrigin({
   globalApi = typeof globalThis !== 'undefined' ? globalThis.CMONEY_TAIEX_API : '',
   search = typeof location !== 'undefined' ? location.search : '',
   metaContent = typeof document !== 'undefined'
@@ -90,7 +45,12 @@ export function resolveLiveApiUrl({
     .map((v) => isSafeHttpOrigin(v))
     .find(Boolean);
   if (!candidate) return '';
-  return candidate.endsWith('/api/taiex') ? candidate : `${candidate}/api/taiex`;
+  return candidate.replace(/\/api\/(taiex|quote|stream)\/?$/i, '').replace(/\/+$/, '');
+}
+
+export function resolveLiveApiUrl(opts = {}) {
+  const origin = resolveApiOrigin(opts);
+  return origin ? `${origin}/api/taiex` : '';
 }
 
 // ---------- 時間 / 交易日 ----------
@@ -125,55 +85,253 @@ export function isTradingDay(dateStr, closedDates = []) {
 /**
  * 是否要顯示「當日資訊尚未揭露」：
  * 今天（台北時間）是交易日，而已抓到的資料日期早於今天。
- * 今天不是交易日 → 不顯示，維持顯示最近一個交易日資訊。
  */
 export function isPending(dataDate, today, closedDates) {
   return isTradingDay(today, closedDates) && (!dataDate || dataDate < today);
 }
 
-/** 台北時間交易日 08:59:00 ～ 13:35:00：啟用大盤盤中 2.5 秒即時輪詢 */
+/** 台北時間交易日 08:55:00 ～ 13:35:00：啟用大盤盤中即時串流 */
 export function inIntradayWindow(dateStr, timeStr, closedDates = []) {
-  return isTradingDay(dateStr, closedDates) && timeStr >= '08:59:00' && timeStr <= '13:35:00';
+  return isTradingDay(dateStr, closedDates) && timeStr >= '08:55:00' && timeStr <= '13:35:00';
+}
+
+/** 取得報價實際成交 Unix Timestamp（毫秒） */
+export function getQuoteTimestampMs(quote) {
+  if (!quote || typeof quote !== 'object') return NaN;
+  const direct = Number(quote.timestampMs);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(quote.date || '')) && /^\d{2}:\d{2}(:\d{2})?$/.test(String(quote.time || ''))) {
+    const t = quote.time.length === 5 ? `${quote.time}:00` : quote.time;
+    const ms = Date.parse(`${quote.date}T${t}+08:00`);
+    return Number.isFinite(ms) && ms > 0 ? ms : NaN;
+  }
+  return NaN;
+}
+
+/**
+ * 單調時間戳防呆（Monotonic Timestamp Guard）：
+ * 只有當「新報價成交時間 > latestQuoteTimestamp」時才允許採用，直接丟棄重複或較舊快取。
+ */
+export function acceptLiveQuote(current, incoming, latestQuoteTimestamp = 0) {
+  if (!incoming || incoming.ok === false || !(incoming.close > 0)) return current;
+  const incomingMs = getQuoteTimestampMs(incoming);
+  if (!Number.isFinite(incomingMs) || incomingMs <= 0) return current;
+  const currentMs = getQuoteTimestampMs(current);
+  const floorMs = Math.max(Number(latestQuoteTimestamp) || 0, Number.isFinite(currentMs) ? currentMs : 0);
+  if (incomingMs <= floorMs) return current;
+  return { ...incoming, timestampMs: incomingMs };
 }
 
 /**
  * 決定大盤卡片此刻應顯示哪份資料：
- * 1. 若盤後正式資料（twse / openapi）已就緒於今日 → 優先顯示盤後正式資料
- * 2. 若盤中即時 Worker 資料屬於今日 → 顯示盤中（或剛收盤之即時終盤），並補齊開高低
+ * 1. 若盤後正式資料（twse / openapi）已就緒於今日 → 顯示盤後正式資料
+ * 2. 若即時行情（富果 / Yahoo 備援）屬於今日 → 顯示即時行情
  * 3. 否則顯示前一交易日資料
  */
 export function selectIndexDisplay(stateIndex, liveIndex, today) {
-  if (stateIndex?.date === today && stateIndex.source && stateIndex.source !== 'mis') {
+  if (stateIndex?.date === today && (stateIndex.source === 'twse' || stateIndex.source === 'openapi')) {
     return stateIndex;
   }
   if (liveIndex?.date === today) {
-    if (
-      stateIndex?.date === today &&
-      stateIndex.fetchedAt &&
-      liveIndex.fetchedAt &&
-      stateIndex.fetchedAt > liveIndex.fetchedAt
-    ) {
-      return {
-        ...stateIndex,
-        ...(stateIndex.open > 0 ? {} : liveIndex.open > 0 ? { open: liveIndex.open } : {}),
-        ...(stateIndex.high > 0 ? {} : liveIndex.high > 0 ? { high: liveIndex.high } : {}),
-        ...(stateIndex.low > 0 ? {} : liveIndex.low > 0 ? { low: liveIndex.low } : {}),
-      };
-    }
     return liveIndex;
   }
   return stateIndex;
 }
 
-export function acceptLiveQuote(current, incoming) {
-  if (!incoming || incoming.ok === false || !(incoming.close > 0)) return current;
-  if (!current) return incoming;
-  if (incoming.date > current.date) return incoming;
-  if (incoming.date < current.date) return current;
-  if (incoming.time && current.time && incoming.time < current.time && !current.stale) {
-    return { ...current, fetchedAt: incoming.fetchedAt || current.fetchedAt };
+// ---------- 單例即時串流與防卡頓備援輪詢控制器 ----------
+
+/**
+ * 前端統一以單例 EventSource 連接 Worker `/api/stream`（避免多餘連線）：
+ *  - start / stop / visibilitychange / pagehide / beforeunload 皆確實呼叫 close()
+ *  - 若瀏覽器環境或網路阻擋 EventSource，自動切換為非重疊遞迴 setTimeout（2.5s + AbortController 2s），
+ *    並每 15 秒嘗試重建 SSE 連線
+ */
+export function createLiveStreamController({
+  apiOrigin,
+  isHidden = () => false,
+  EventSourceCtor = typeof globalThis !== 'undefined' ? globalThis.EventSource : undefined,
+  fetchImpl = typeof globalThis !== 'undefined' && globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined,
+  nowFn = () => Date.now(),
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  pollMs = FALLBACK_POLL_MS,
+  streamRetryMs = STREAM_RETRY_MS,
+  fetchTimeoutMs = FETCH_TIMEOUT_MS,
+  onQuote = () => {},
+  onError = (e) => console.warn('即時行情連線異常', e?.message ?? e),
+} = {}) {
+  let es = null;
+  let active = false;
+  let pollTimer = null;
+  let retrySseTimer = null;
+  let inFlight = false;
+  let inFlightCtrl = null;
+  let inFlightAbortTimer = null;
+  let sseErrorCount = 0;
+
+  function abortInFlight() {
+    if (inFlightAbortTimer != null) {
+      clearTimer(inFlightAbortTimer);
+      inFlightAbortTimer = null;
+    }
+    if (inFlightCtrl) {
+      try {
+        inFlightCtrl.abort();
+      } catch {}
+      inFlightCtrl = null;
+    }
+    inFlight = false;
   }
-  return incoming;
+
+  function clearTimers() {
+    if (pollTimer != null) {
+      clearTimer(pollTimer);
+      pollTimer = null;
+    }
+    if (retrySseTimer != null) {
+      clearTimer(retrySseTimer);
+      retrySseTimer = null;
+    }
+    abortInFlight();
+  }
+
+  function closeEventSource() {
+    if (!es) return;
+    try {
+      es.close();
+    } catch {}
+    es = null;
+  }
+
+  async function fetchSnapshotOnce() {
+    if (!apiOrigin || !fetchImpl || inFlight || isHidden()) return;
+    inFlight = true;
+    const ctrl = new AbortController();
+    inFlightCtrl = ctrl;
+    inFlightAbortTimer = setTimer(() => ctrl.abort(), fetchTimeoutMs);
+    try {
+      const res = await fetchImpl(`${apiOrigin}/api/taiex?_t=${nowFn()}`, {
+        cache: 'no-store',
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      onQuote(json);
+    } catch (err) {
+      if (!ctrl.signal.aborted) onError(err);
+    } finally {
+      if (inFlightCtrl === ctrl) {
+        if (inFlightAbortTimer != null) {
+          clearTimer(inFlightAbortTimer);
+          inFlightAbortTimer = null;
+        }
+        inFlightCtrl = null;
+        inFlight = false;
+      }
+    }
+  }
+
+  function schedulePoll(delay = pollMs) {
+    if (pollTimer != null) {
+      clearTimer(pollTimer);
+      pollTimer = null;
+    }
+    if (!active || isHidden() || es) return;
+    pollTimer = setTimer(async () => {
+      pollTimer = null;
+      if (!active || isHidden() || es) return;
+      await fetchSnapshotOnce();
+      if (active && !isHidden() && !es) schedulePoll(pollMs);
+    }, delay);
+  }
+
+  function scheduleSseRetry() {
+    if (retrySseTimer != null || !active || isHidden() || typeof EventSourceCtor !== 'function') return;
+    retrySseTimer = setTimer(() => {
+      retrySseTimer = null;
+      if (active && !isHidden() && !es) openStream();
+    }, streamRetryMs);
+  }
+
+  function openStream() {
+    if (!active || isHidden() || !apiOrigin) return;
+    if (es) return; // 單例守門：不允許同時存在兩條 EventSource
+
+    if (typeof EventSourceCtor !== 'function') {
+      schedulePoll(0);
+      return;
+    }
+
+    const sock = new EventSourceCtor(`${apiOrigin}/api/stream`);
+    es = sock;
+
+    sock.addEventListener('open', () => {
+      if (es !== sock) return;
+      sseErrorCount = 0;
+      if (pollTimer != null) {
+        clearTimer(pollTimer);
+        pollTimer = null;
+      }
+      if (retrySseTimer != null) {
+        clearTimer(retrySseTimer);
+        retrySseTimer = null;
+      }
+    });
+
+    sock.addEventListener('quote', (ev) => {
+      if (es !== sock) return;
+      sseErrorCount = 0;
+      try {
+        const data = typeof ev?.data === 'string' ? JSON.parse(ev.data) : ev?.data;
+        onQuote(data);
+      } catch {}
+    });
+
+    sock.addEventListener('error', (err) => {
+      if (es !== sock) return;
+      sseErrorCount += 1;
+      if (sseErrorCount >= 3 || sock.readyState === 2) {
+        closeEventSource();
+        onError(err);
+        schedulePoll(0);
+        scheduleSseRetry();
+      }
+    });
+  }
+
+  function start() {
+    if (!apiOrigin || isHidden()) return;
+    if (active && es) return;
+    active = true;
+    sseErrorCount = 0;
+    openStream();
+    // 同步立即拉一次快照，避免 SSE 握手期間畫面空白
+    fetchSnapshotOnce();
+  }
+
+  function stop() {
+    active = false;
+    clearTimers();
+    closeEventSource();
+  }
+
+  function onVisibilityChange() {
+    if (isHidden()) {
+      clearTimers();
+      closeEventSource();
+    } else if (active) {
+      sseErrorCount = 0;
+      openStream();
+      fetchSnapshotOnce();
+    }
+  }
+
+  return {
+    start,
+    stop,
+    onVisibilityChange,
+    isConnected: () => Boolean(es),
+  };
 }
 
 // ---------- 格式化 ----------
@@ -190,8 +348,8 @@ export const fmtDate = (d) => {
   return `${y}/${m}/${day}（${WEEK[dow]}）`;
 };
 
-const fmtTime = (iso, withSec = false) => {
-  if (!iso) return '';
+const fmtTime = (isoOrMs, withSec = false) => {
+  if (!isoOrMs) return '';
   return new Intl.DateTimeFormat('zh-TW', {
     timeZone: TZ,
     hourCycle: 'h23',
@@ -200,8 +358,19 @@ const fmtTime = (iso, withSec = false) => {
     hour: '2-digit',
     minute: '2-digit',
     ...(withSec ? { second: '2-digit' } : {}),
-  }).format(new Date(iso));
+  }).format(new Date(isoOrMs));
 };
+
+export function formatQuoteTime(timestampMs) {
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0) return '';
+  return new Intl.DateTimeFormat('zh-TW', {
+    timeZone: TZ,
+    hourCycle: 'h23',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(timestampMs));
+}
 
 /** 元 → 億（兩位小數，含正負號） */
 export const toYiSigned = (yuan) => {
@@ -249,19 +418,6 @@ export function renderIndex(d) {
       </div>`
     : '';
 
-  let subNote = '';
-  if (d.marketPhase === 'intraday') {
-    if (d.stale) subNote = '（即時連線重試中，暫顯示最近一筆快取）';
-    else if (d.source === 'yahoo_tw') subNote = '（Yahoo 奇摩股市盤中即時）';
-    else if (d.source === 'cnyes') subNote = '（鉅亨網盤中即時）';
-    else if (d.source === 'yahoo') subNote = '（Yahoo Finance 盤中即時備援）';
-    else subNote = '（證交所盤中即時行情）';
-  } else if (d.source === 'mis') {
-    subNote = '<br>暫用證交所即時行情終盤值，稍後以盤後正式資料確認';
-  } else if (d.source === 'yahoo' || d.source === 'yahoo_tw' || d.source === 'cnyes') {
-    subNote = '<br>暫用即時行情終盤值，稍後以盤後正式資料確認';
-  }
-
   return `
     <div class="index__wrap">
       <div class="index ${cls}">
@@ -273,18 +429,19 @@ export function renderIndex(d) {
       </div>
       ${ohlcHtml}
     </div>
-    <p class="sub">較前一交易日收盤${subNote}</p>`;
+    <p class="sub">較前一交易日收盤</p>`;
 }
 
+/** 畫面資料源標籤僅保留兩種即時狀態：富果盤中即時 與 Yahoo 盤中即時 (備援) */
 export function indexBadge(d, today) {
   if (!d || d.date !== today) return '';
-  if (d.marketPhase === 'intraday') {
-    return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>盤中即時</span>';
+  if (d.source === 'fugle') {
+    return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>富果盤中即時</span>';
   }
-  if (d.source === 'mis' || d.source === 'yahoo' || d.source === 'yahoo_tw' || d.source === 'cnyes') {
-    return '<span class="badge badge--temp">即時終盤</span>';
+  if (d.source === 'yahoo') {
+    return '<span class="badge badge--backup">Yahoo 盤中即時 (備援)</span>';
   }
-  return '<span class="badge badge--closed">已收盤</span>';
+  return '';
 }
 
 function renderInst(d) {
@@ -369,16 +526,18 @@ function renderCard(card, state, today, liveIndex) {
     foot.textContent = '';
   } else {
     body.innerHTML = card.render(d);
-    const timeText =
-      card.key === 'index' && d.date === today && d.time
-        ? `報價 ${escapeHtml(d.time)}`
-        : d.fetchedAt
-          ? `擷取 ${fmtTime(d.fetchedAt)}`
-          : '';
+    let timeText = '';
+    if (card.key === 'index' && d.date === today) {
+      const tsMs = getQuoteTimestampMs(d);
+      const clockStr = Number.isFinite(tsMs) ? formatQuoteTime(tsMs) : d.time;
+      if (clockStr) timeText = `成交時間 ${escapeHtml(clockStr)}`;
+      else if (d.fetchedAt) timeText = `擷取 ${fmtTime(d.fetchedAt)}`;
+    } else if (d.fetchedAt) {
+      timeText = `擷取 ${fmtTime(d.fetchedAt)}`;
+    }
     foot.innerHTML = `<span>資料日期 <b>${fmtDate(d.date)}</b></span><span>${timeText}</span>`;
   }
 
-  // 每個資訊各自判斷：交易日且尚未取得當日資料 → 顯示「當日資訊尚未揭露」
   const pending = isPending(d?.date, today, state?.closedDates ?? []);
   notice.hidden = !pending;
   if (pending) {
@@ -388,8 +547,6 @@ function renderCard(card, state, today, liveIndex) {
   }
   el.classList.toggle('is-pending', pending);
 
-  // 三大法人：已取得當日不含鉅額版本、等待 20:00 後含鉅額版本。
-  // 保留提示文字，但不加粗框（粗框只用在「當日資訊尚未揭露」）
   if (card.key === 'institutional' && d && d.date === today && d.stage === 'ex_block') {
     notice.hidden = false;
     notice.textContent = '目前為不含鉅額版本，20:00 後將更新為含鉅額';
@@ -398,33 +555,64 @@ function renderCard(card, state, today, liveIndex) {
 
 let state = null;
 let liveState = null;
+let latestQuoteTimestamp = 0;
 let lastSig = '';
 
 export function renderAll() {
   const { date: today, time } = taipeiNow();
   document.getElementById('clock').textContent = time;
   if (!state) return;
-  // 只有「日期變了」或「盤後／盤中資料變了」才重畫卡片（避免每秒重繪）
-  const liveSig = liveState
-    ? `${liveState.date}|${liveState.time}|${liveState.close}|${liveState.stale ? 1 : 0}|${liveState.fetchedAt}`
-    : '';
+
+  const activeIndex = selectIndexDisplay(state.index, liveState, today);
+  const liveSig =
+    activeIndex === liveState && liveState
+      ? `${liveState.date}|${getQuoteTimestampMs(liveState)}|${liveState.close}|${liveState.source}`
+      : '';
   const sig = `${today}|${state.meta?.updatedAt}|${liveSig}`;
   if (sig === lastSig) return;
   lastSig = sig;
+
   for (const c of CARDS) renderCard(c, state, today, liveState);
-  const candidates = [state.meta?.updatedAt];
-  if (liveState?.date === today && liveState.fetchedAt) candidates.push(liveState.fetchedAt);
-  const latestIso = candidates.filter(Boolean).sort().at(-1);
-  const showSec = Boolean(liveState?.date === today && latestIso === liveState.fetchedAt);
-  document.getElementById('meta-updated').textContent = latestIso
-    ? `資料更新：${fmtTime(latestIso, showSec)}（台北時間）`
-    : '資料更新：—';
+
+  const metaEl = document.getElementById('meta-updated');
+  if (activeIndex === liveState && liveState?.date === today) {
+    const quoteMs = getQuoteTimestampMs(liveState);
+    metaEl.textContent = Number.isFinite(quoteMs)
+      ? `報價成交時間：${fmtTime(quoteMs, true)}（台北時間）`
+      : '報價成交時間：—';
+  } else {
+    metaEl.textContent = state.meta?.updatedAt
+      ? `資料更新：${fmtTime(state.meta.updatedAt)}（台北時間）`
+      : '資料更新：—';
+  }
 }
 
-/**
- * GitHub Pages 發佈要等 Pages 部署（通常 30 秒～數分鐘），所以另外直接讀 GitHub API 上的最新檔案，
- * 兩邊取較新的一份。僅在 *.github.io 上、且是盤後資料可能更新的時段才讀（避免耗用 API 額度）。
- */
+/** 與民德市政府官網同規格的累積瀏覽總人次計數 */
+export async function initVisitCounter({
+  apiOrigin = resolveApiOrigin(),
+  fetchImpl = typeof globalThis !== 'undefined' && globalThis.fetch ? globalThis.fetch.bind(globalThis) : null,
+  documentRef = typeof document !== 'undefined' ? document : null,
+} = {}) {
+  const el = documentRef?.getElementById?.('siteVisitCount');
+  if (!el || !apiOrigin || !fetchImpl) return null;
+  try {
+    const res = await fetchImpl(`${apiOrigin}/api/stats/visits`, {
+      method: 'POST',
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const count = Number(data?.visits);
+    if (data?.ok && Number.isFinite(count) && count >= 0) {
+      el.textContent = Math.max(0, Math.floor(count)).toLocaleString('zh-TW');
+      return Math.floor(count);
+    }
+  } catch (err) {
+    console.warn('讀取網站累積瀏覽人數失敗', err?.message ?? err);
+  }
+  return null;
+}
+
 function githubApiUrl() {
   if (typeof location === 'undefined' || !location.hostname.endsWith('.github.io')) return null;
   const owner = location.hostname.split('.')[0];
@@ -446,7 +634,6 @@ async function fetchPages() {
 async function fetchGithubApi() {
   const url = githubApiUrl();
   if (!url || !inFreshWindow()) return null;
-  // cache: 'no-cache' 會帶 ETag 重新驗證；沒變時回 304，不佔 API 額度
   const res = await fetch(url, {
     cache: 'no-cache',
     headers: { Accept: 'application/vnd.github.raw+json' },
@@ -457,42 +644,32 @@ async function fetchGithubApi() {
 
 const newer = (a, b) => ((a?.meta?.updatedAt ?? '') >= (b?.meta?.updatedAt ?? '') ? a : b);
 
-let liveInFlight = false;
-
-async function loadLive() {
-  if (typeof document !== 'undefined' && document.hidden) return;
-  const endpoint = resolveLiveApiUrl();
-  if (!endpoint || liveInFlight || !state) return;
-
+function syncLiveLifecycle() {
+  if (!liveController || !state) return;
   const { date: today, time } = taipeiNow();
   const forceLive =
     typeof location !== 'undefined' && new URLSearchParams(location.search).get('forceLive') === '1';
-  if (!forceLive) {
-    if (!inIntradayWindow(today, time, state.closedDates ?? [])) return;
-    if (state.index?.date === today && state.index.source && state.index.source !== 'mis') return;
-  }
+  const settledToday =
+    state.index?.date === today && (state.index.source === 'twse' || state.index.source === 'openapi');
 
-  liveInFlight = true;
-  try {
-    // _t 時間戳 + no-store：不吃任何瀏覽器／中間代理的舊快取
-    const sep = endpoint.includes('?') ? '&' : '?';
-    const res = await fetch(`${endpoint}${sep}_t=${Date.now()}`, { cache: 'no-store' });
-    if (!res.ok) return;
-    const json = await res.json();
-    const next = acceptLiveQuote(liveState, json);
-    if (next && next !== liveState) {
-      liveState = next;
-      renderAll();
-    }
-  } catch (e) {
-    console.warn('讀取盤中即時大盤失敗', e?.message ?? e);
-  } finally {
-    liveInFlight = false;
+  if (forceLive || (!settledToday && inIntradayWindow(today, time, state.closedDates ?? []))) {
+    liveController.start();
+  } else {
+    liveController.stop();
+  }
+}
+
+function handleIncomingQuote(raw) {
+  const next = acceptLiveQuote(liveState, raw, latestQuoteTimestamp);
+  if (next && next !== liveState) {
+    latestQuoteTimestamp = getQuoteTimestampMs(next);
+    liveState = next;
+    renderAll();
   }
 }
 
 async function load() {
-  if (typeof document !== 'undefined' && document.hidden && state) return; // 分頁在背景時不更新
+  if (typeof document !== 'undefined' && document.hidden && state) return;
   const [pages, api] = await Promise.allSettled([fetchPages(), fetchGithubApi()]);
   const got = [pages, api].filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
   if (got.length) {
@@ -506,27 +683,35 @@ async function load() {
     }
   }
   renderAll();
-  // 第一次取得盤後資料後，啟動盤中即時輪詢（之後由 livePoller 遞迴排程，不再由 load 觸發）
-  if (!liveKicked && state) {
-    liveKicked = true;
-    livePoller?.start();
-  }
+  syncLiveLifecycle();
 }
 
-let livePoller = null;
-let liveKicked = false;
+let liveController = null;
 
 if (typeof document !== 'undefined') {
-  livePoller = createLivePoller({ run: loadLive, isHidden: () => document.hidden });
+  const apiOrigin = resolveApiOrigin();
+  liveController = createLiveStreamController({
+    apiOrigin,
+    isHidden: () => document.hidden,
+    onQuote: handleIncomingQuote,
+  });
+
+  initVisitCounter({ apiOrigin });
   load();
-  setInterval(load, 30 * 1000); // 每 30 秒同步盤後資料 / 行事曆
-  setInterval(renderAll, 1000); // 每秒更新時鐘；跨過 00:00 時自動切換「尚未揭露」狀態
+  setInterval(load, 30 * 1000);
+  setInterval(() => {
+    renderAll();
+    syncLiveLifecycle();
+  }, 1000);
+
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      livePoller.stop(); // 切到其他分頁／縮小視窗：暫停即時抓取
+      liveController.onVisibilityChange();
     } else {
-      load(); // 切回網頁：立刻同步盤後資料，並立即抓一次即時報價、恢復 2.5 秒輪詢
-      livePoller.start();
+      load();
+      liveController.onVisibilityChange();
     }
   });
+  window.addEventListener('pagehide', () => liveController.stop());
+  window.addEventListener('beforeunload', () => liveController.stop());
 }

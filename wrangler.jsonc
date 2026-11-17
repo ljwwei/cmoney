@@ -1,0 +1,27 @@
+{
+  "name": "cmoney-taiex",
+  "main": "worker/worker.js",
+  "compatibility_date": "2026-11-01",
+  "vars": {
+    "FUGLE_SYMBOL": "IX0001"
+  },
+  // 全站唯一一條富果 WebSocket 連線單例（Free Plan 支援 SQLite-backed Durable Objects）
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FUGLE_HUB",
+        "class_name": "FugleHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FugleHub"]
+    }
+  ]
+  // 若另外建立了獨立 D1 資料庫給人數計次，可取消下方註解並填入 database_id（或於 Dashboard Bindings 綁定 DB）：
+  // "d1_databases": [
+  //   { "binding": "DB", "database_name": "cmoney", "database_id": "<你的-D1-DATABASE-ID>" }
+  // ]
+}

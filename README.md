@@ -1,13 +1,14 @@
 # 台股資訊 cmoney
 
-台股盤中即時大盤 + 每日盤後資訊網站（純靜態頁 + GitHub Actions 定時抓取 + 可選 Cloudflare Worker 盤中即時代理），電腦版與手機版各自優化排版。
+台股盤中即時大盤（富果 WebSocket 主力 + Yahoo 條件備援）+ 每日盤後資訊網站（純靜態頁 + GitHub Actions 定時抓取 + Cloudflare Worker / Durable Object 單例即時代理 + 網站瀏覽人次計數），電腦版與手機版各自優化排版。
 
 | 資訊 | 來源 | 規則 |
 |---|---|---|
-| 加權指數 | 盤中：Cloudflare Worker 並發比對 證交所 MIS／Yahoo 奇摩股市／鉅亨網，取成交時間最新者（Yahoo `^TWII` 為最後備援）<br>盤後：證交所 `MI_INDEX` + `MI_5MINS_HIST` | 盤中每 2.5 秒輪詢即時更新（開盤、最高、最低、最新指數與漲跌）；盤後取正式收盤與開高低，若缺漏則以前一交易日收盤自行計算。紅漲綠跌 |
+| 加權指數 | 盤中：Cloudflare Worker + Durable Object (`FugleHub`) 單例連線**富果 Fugle WebSocket** + Intraday Quote 快照（嚴格條件啟動 **Yahoo `^TWII`** 備援）<br>盤後：證交所 `MI_INDEX` + `MI_5MINS_HIST` | 啟動時先抓快照防空白，並透過唯一一條 WS 接收即時跳動（`/api/stream` SSE 廣播，SSE 受阻時前端自動退回非重疊 2.5 秒輪詢）；單調時間戳防呆只進不退；紅漲綠跌 |
 | 三大法人買賣超 | 證交所 `BFI82U` | 外資、投信、自營商（自行買賣＋避險）買賣超金額（億）。買超紅、賣超綠。標註「不含鉅額 / 含鉅額」 |
 | 外資台股期貨未平倉 | 期交所「三大法人-區分各期貨契約」CSV | 外資及陸資・臺股期貨・未平倉多空淨額，取絕對值顯示口數（−103473 → 103,473 口 淨空單） |
 | 融資餘額 | 證交所 `MI_MARGN` | 融資金額今日餘額（仟元）→ 億（四捨五入），並與「前日餘額」比較顯示增減（億，1 位小數） |
+| 累積瀏覽總人次 | Cloudflare D1 (`DB`)／`FugleHub` 內建 SQLite (`site_counters`) | 載入首頁時呼叫 `POST /api/stats/visits`，與民德市政府官網同規格累加顯示於頁尾 |
 
 ## 抓取時間（台北時間，非交易日一律不抓）
 
@@ -15,74 +16,62 @@
 
 | 項目 | 開始 | 結束條件 |
 |---|---|---|
-| 加權指數 | 13:30 | 取得證交所盤後正式資料（先拿到即時行情終盤值會先顯示，再被正式值覆蓋；18:00 後不再追正式值） |
+| 加權指數 | 13:30 | 取得證交所盤後正式資料（`MI_INDEX` 含完整開高低；若先拿到純收盤值會先顯示並標記 `ohlcPending`，18:00 前持續等待補齊） |
 | 外資期貨未平倉 | 14:30 | 抓到當日資料 |
 | 三大法人（不含鉅額） | 14:30 | 抓到當日資料 |
 | 三大法人（含鉅額） | 20:00 | 證交所說明文字變為「含鉅額」 |
 | 融資餘額 | 20:30 | 抓到當日資料 |
 
-### 加權指數來源（依序取用）
-1. 證交所盤後統計 `MI_INDEX?type=IND`（正式資料）
-2. 證交所即時行情 `mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw`：13:30 收盤後（約 13:33）就有終盤值（`t ≥ 13:30:00`），漲跌以 `y`（前收）計算。卡片會註明「暫用即時行情終盤值」，等 `MI_INDEX` 出來後自動換成正式值
-3. 證交所 OpenAPI `/v1/indicesReport/MI_5MINS_HIST`（發行量加權股價指數歷史日資料）：前兩者失敗時的備援
+### 加權指數來源
+1. **盤中即時（主力）**：Cloudflare Worker `FugleHub` Durable Object 維持唯一一條 `wss://api.fugle.tw/marketdata/v1.0/stock/streaming`（`indices` 頻道、`IX0001`）＋ 初期 `/stock/intraday/quote/IX0001` 快照防空白。無任何前端連線超過 30 秒自動關閉 WS 釋放免費額度；遭遇 `Close Code 1013` 冷卻至少 15 秒。
+2. **盤中備援（預設完全休眠）**：僅在「未設定 `FUGLE_API_KEY`」、「WS 連敗 3 次或斷線逾 10 秒」、或「盤中 `09:00–13:30` 逾 12 秒無資料與 ping/pong 回應」時，啟動 Yahoo 輪詢（`AbortController` `2000ms` + `&_=` 防快取 + 遞迴 `setTimeout`），並在背景每 15 秒嘗試回切富果。
+3. **盤後正式**：證交所 `MI_INDEX?type=IND` ＋ `MI_5MINS_HIST`（失敗時退回證交所 OpenAPI `/v1/indicesReport/MI_5MINS_HIST`）。
 
 > `/indicesReport/MFI94U` 是「發行量加權股價**報酬**指數」，不是我們要的加權股價指數，所以不採用。
 
 ### 排程喚醒架構
-1. **精準喚醒（Cloudflare Workers Cron）**：
-   GitHub Actions 的免費原生 cron 常有嚴重延遲（甚至延遲 7~8 小時在半夜殭屍觸發）與隨機跳過問題。因此已徹底移除 GitHub 內建 `schedule:`，100% 透過外部 Cloudflare Worker 的 Cron Trigger（平日 13:20–21:30 區間準點發動），分秒不差地發送 `workflow_dispatch` 喚醒 GitHub Actions。
-2. **常駐輪詢與時段守門員**：
-   job 被喚醒後，若在台北時間 13:00 前（非盤後時段）會於 5 秒內直接安全退出；進入 13:00~23:55 盤後時段則在同一個 runner 內每 30 秒執行一次抓取，直到當日所有項目抓齊才優雅退出。單一 job 上限 6 小時，接近時會自我接力。`concurrency` 設定 `cancel-in-progress: false` 確保同時間只有 1 個 job 在輪詢。
-3. **前端即時同步**：
-   除了 GitHub Pages 的 `data.json`，前端在盤後時段（13:25 後）也會直接透過 GitHub API 讀取最新 raw 檔案，免去 Pages 部署的等待延遲。
+1. **精準喚醒（Cloudflare Workers Cron）**：透過 Worker `scheduled` Cron Trigger（平日 13:20–21:30 區間）發送 `workflow_dispatch` 喚醒 GitHub Actions。
+2. **常駐輪詢與時段守門員**：進入 13:00~23:55 盤後時段後在同一個 runner 內每 30 秒執行一次抓取，直到當日所有項目抓齊退出。
+3. **前端即時同步**：除了 GitHub Pages 的 `data.json`，前端在盤後時段（13:25 後）也會直接透過 GitHub API 讀取最新 raw 檔案，免去 Pages 部署的等待延遲。
 
-### 非交易日機制
-1. 週六、週日不抓。
-2. 國定假日、春節長假等：每天讀取證交所 `holidaySchedule`（排除「開始交易日／最後交易日」），列入 `closedDates`。
-3. 颱風等**臨時休市**：08:30 會更新行事曆；若行事曆尚未收錄，則在 16:00 後 `MI_INDEX` 與即時行情都「正常回應但確定無今日資料」時，推斷當日休市（寫入 `inferredClosed`），當日不再抓取。
-4. 若誤判，可用 Actions 手動補抓該日期，有資料時會自動撤銷休市判定。
-
-### 「當日資訊尚未揭露」
-前端以台北時間判斷：**今天是交易日、且該項資料日期早於今天**（即 00:00 之後到抓到新資料前）→ 該卡片顯示註明並維持顯示前一交易日資料；抓到當日資料後註明自動消失。今天不是交易日則不顯示註明，直到交易日當天 00:00。四個資訊各自獨立判斷。
-
-### 資料防呆
-外資期貨整列全 0、多空未平倉皆為 0，或三大法人／融資金額全 0，都視為「期交所／證交所尚未提供正式資料」，不寫入、繼續輪詢，直到抓到正常資料。已存的全 0 期貨資料也會被視為未抓齊而重抓。
+### 非交易日機制 & 資料防呆
+1. 週六、週日與證交所 `holidaySchedule` 列入 `closedDates` 不抓；16:00 後 `MI_INDEX` 正常回應但確定無今日資料時推斷為臨時休市（`inferredClosed`）。
+2. 外資期貨整列全 0、多空未平倉皆為 0，或三大法人／融資金額全 0，皆視為尚未公布正式資料，不寫入並繼續輪詢。
 
 ## 專案結構
 
 ```
-index.html, css/style.css, js/app.js   前端（RWD：手機 <600px、平板、電腦 ≥960px 各自排版）
-data/data.json                         抓取結果（由 Actions 自動 commit）
-scripts/fetch.mjs                      盤後抓取主程式
-scripts/schedule.mjs                   排程／交易日判斷（純函式）
-scripts/parsers.mjs                    各來源解析
-worker/worker.js                       Cloudflare Worker 盤中大盤即時代理（三源 0.8 秒超時並發、上游防快取、2 秒 Edge Cache）
+index.html, css/style.css, js/app.js   前端（單例 EventSource SSE、單調時間戳、僅顯示富果/Yahoo備援標籤、頁尾人數計次）
+data/data.json                         盤後抓取結果（由 Actions 自動 commit）
+scripts/fetch.mjs, parsers.mjs, schedule.mjs   盤後抓取／解析／排程模組
+worker/core.mjs                        Fugle WS 單例引擎、Yahoo 條件備援、SSE 與計次純邏輯（可供 Node 單元測試）
+worker/worker.js                       Cloudflare Worker + Durable Object (FugleHub) 進入點
+wrangler.jsonc                         Cloudflare Worker / SQLite Durable Object 部署組態
+.env.example                           環境變數與 FUGLE_API_KEY Secret 設定範例
 .github/workflows/update.yml           盤後定時排程
 tests/logic.test.mjs                   單元測試（node --test tests/）
 ```
 
-## 啟用盤中即時大盤（Cloudflare Worker）
-1. 將 [worker/worker.js](worker/worker.js) 貼上並部署到 Cloudflare Worker（如 `cmoney-taiex`；可選擇與原本的 Cron Trigger 共用同支 Worker）。
-2. 將部署好的 Worker 網址填入 [index.html](index.html) 的 `<meta name="taiex-api" content="https://你的worker.workers.dev" />` 並推上 GitHub。
-3. 交易日台北時間 `08:59 ~ 13:35` 開啟官網時，會以遞迴 `setTimeout` 每 2.5 秒向 Worker 取得即時加權指數（上一次請求結束後才倒數；分頁切到背景自動暫停，切回立即補抓一次）；盤後正式資料產出後自動切回靜態 `data/data.json`。
-   - Worker 對上游（證交所、Yahoo 奇摩股市、鉅亨網）每個請求都帶 `_=時間戳`、`cf.cacheTtl=0`、`Cache-Control: no-cache`，並採用保底競速（0.8 秒時已有任一家成功即截斷慢來源；若三家全未回則最多寬限至 1.8 秒搶第一家成功者）；共享快取 `s-maxage=2`，同一個 Cloudflare 資料中心對上游最多每 2 秒發出一輪請求。
-   - 測試期也可免改程式，直接在網址後方加上 `?liveApi=https://你的worker.workers.dev&forceLive=1` 立即測試連線。
+## 啟用盤中即時大盤與人數計次（Cloudflare Worker）
+因富果免費方案嚴格限制 WebSocket 同時連線數（超限會斷線 `Close Code 1013`），本專案使用 `wrangler.jsonc` 定義的 **SQLite-backed Durable Object (`FugleHub`)**（Workers 免費方案即可使用）統一維持後端唯一一條 WS 連線並儲存累積瀏覽人次：
 
-## 部署
-1. 推到 GitHub 後：**Settings → Pages → Build and deployment → Deploy from a branch → `main` / `(root)`**。
-2. **Settings → Actions → General → Workflow permissions** 選 *Read and write permissions*（workflow 已宣告 `contents: write`，通常即可）。
-3. 網站網址：`https://ljwwei.github.io/cmoney/`
+1. **設定環境變數 Secret**（切勿寫死於程式碼或送進 Git）：
+   ```bash
+   npx wrangler secret put FUGLE_API_KEY
+   ```
+   （本機開發可複製 `.env.example` 為 `.dev.vars`；若為正式公開網站，請於富果後台限制 API Key 網域或白名單）
+2. **部署 Worker**（需讓 `wrangler.jsonc` 中的 Durable Object migration 生效，請勿只用控制台貼上單檔）：
+   - 方式 A（本機 CLI）：執行 `npx wrangler deploy`
+   - 方式 B（Cloudflare Dashboard 自動部署）：Worker 連結此 GitHub 儲存庫（Workers Builds），每次推上 `main` 即依 `wrangler.jsonc` 自動部署。
+   - （選用）若想獨立保存計次於 D1，可在 `wrangler.jsonc` 取消 `d1_databases` 註解並建立資料庫；未綁定 D1 時已自動由 `FugleHub` 內建 SQLite 永久計次。
+3. 將部署好的 Worker 網址填入 [index.html](index.html) 的 `<meta name="taiex-api" content="https://你的worker.workers.dev" />`（預設已填 `cmoney-taiex.gamerwillywilly.workers.dev`）。
+   - 測試期也可直接在網址後方加上 `?liveApi=https://你的worker.workers.dev&forceLive=1` 立即驗證即時連線。
 
-## 本機
+## 部署與本機測試
+1. 推到 GitHub 後啟用 Pages（`main` / `(root)`），網站網址：`https://ljwwei.github.io/cmoney/`
+2. 本機指令：
+```bash
+npm test                                  # 執行單元測試
+node scripts/fetch.mjs --date=2026-11-10  # 補抓指定日期盤後資料
+node scripts/serve.mjs                    # 預覽 http://localhost:8080
 ```
-npm test                                # 單元測試
-node scripts/fetch.mjs --date=2026-11-10  # 補抓指定日期
-node scripts/serve.mjs                  # 預覽 http://localhost:8080
-```
-
-## 注意
-- 輪詢 job 在抓齊前（含 15:00～20:00 等待含鉅額／融資的空檔）會一直佔著 runner；公開 repo 的 Actions 分鐘數免費，若改成私有 repo 請留意用量。
-- 三大法人「不含／含鉅額」以證交所 API 回傳的說明文字（`notes`）為準：本統計資訊含一般、零股、盤後定價、鉅額… 判為「含鉅額」；鉅額被列在「不含」之後則判為「不含鉅額」。說明文字缺漏或無法判讀時，才退回依抓取時間（20:00 前／後）標註。若 15:00 抓到的已是含鉅額版本，就不會再重抓；若是不含鉅額，則 20:00 後每 30 秒重抓，直到說明文字變為含鉅額。
-- 資料僅供參考，不構成投資建議。
-
-

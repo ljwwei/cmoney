@@ -25,7 +25,6 @@ import {
   parseInstitutional,
   parseBlockTradeScope,
   parseMargin,
-  parseMisIndex,
   parseOpenApiIndexHist,
   parseTwseIndexHist,
 } from './parsers.mjs';
@@ -67,25 +66,16 @@ const getJson = async (url) => JSON.parse((await httpGet(url)).toString('utf8'))
 
 // ---- 各資料來源。回傳 { status: 'ok' | 'nodata', value } ；網路錯誤則丟出例外 ----
 
-// 加權指數有三個來源，依序取用：
-//   1. 證交所盤後統計 MI_INDEX（正式資料，含漲跌點數與百分比）
-//   2. 證交所即時行情 mis（13:30 收盤後約 13:33 就有終盤值，比盤後統計早）
-//   3. 證交所 OpenAPI MI_5MINS_HIST（歷史日資料；前兩者都失敗時的備援）
-// 先拿到 mis 的值會標記 source = 'mis'，之後 MI_INDEX 出來會自動覆蓋為正式值。
+// 加權指數盤後來源：
+//   1. 證交所盤後統計 MI_INDEX（正式收盤價與漲跌）
+//   2. 證交所每日指數統計 MI_5MINS_HIST（開盤、最高、最低與備援收盤）
+//   3. 證交所 OpenAPI MI_5MINS_HIST（前兩者失敗時的備援）
 async function fetchIndexTwse(date) {
   const json = await getJson(
     `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${ymd(date)}&type=IND&response=json&_=${Date.now()}`,
   );
   if (json.date && json.date !== ymd(date)) return { status: 'nodata' };
   const v = parseIndex(json);
-  return v ? { status: 'ok', value: v } : { status: 'nodata' };
-}
-
-async function fetchIndexMis(date) {
-  const json = await getJson(
-    `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0&_=${Date.now()}`,
-  );
-  const v = parseMisIndex(json, date);
   return v ? { status: 'ok', value: v } : { status: 'nodata' };
 }
 
@@ -117,18 +107,17 @@ function attachOhlc(base, ...sources) {
 /**
  * 回傳 { status: 'ok', value, source } 或 { status: 'nodata', certain }。
  * certain = 主要來源都「正常回應、但確定沒有今日資料」（用於判斷臨時休市；網路錯誤不算）。
- * 一併取得開盤、最高、最低（優先由 MI_5MINS_HIST，其次由 mis 補齊）。
+ * 一併取得開盤、最高、最低（由 MI_5MINS_HIST 補齊）。
  */
 async function fetchIndex(date) {
-  const [twse, mis, histRwd] = await Promise.allSettled([
+  const [twse, histRwd] = await Promise.allSettled([
     fetchIndexTwse(date),
-    fetchIndexMis(date),
     fetchIndexHistRwd(date),
   ]);
   const ok = (r) => r.status === 'fulfilled' && r.value.status === 'ok';
   const val = (r) => (ok(r) ? r.value.value : null);
 
-  for (const [name, r] of [['MI_INDEX', twse], ['mis', mis], ['MI_5MINS_HIST', histRwd]]) {
+  for (const [name, r] of [['MI_INDEX', twse], ['MI_5MINS_HIST', histRwd]]) {
     if (r.status === 'rejected') console.warn(`加權指數來源 ${name} 失敗：${r.reason?.message ?? r.reason}`);
   }
 
@@ -137,16 +126,13 @@ async function fetchIndex(date) {
   if (ok(twse)) {
     base = val(twse);
     source = 'twse';
-  } else if (ok(mis)) {
-    base = val(mis);
-    source = 'mis';
   } else if (ok(histRwd)) {
     base = val(histRwd);
     source = 'twse';
   }
 
   if (base) {
-    let enriched = attachOhlc(base, val(histRwd), val(mis));
+    let enriched = attachOhlc(base, val(histRwd));
     if (!(enriched.open > 0 && enriched.high > 0 && enriched.low > 0)) {
       try {
         const oa = await fetchIndexOpenApi(date);
@@ -164,12 +150,12 @@ async function fetchIndex(date) {
   } catch (e) {
     console.warn(`加權指數來源 OpenAPI 失敗：${e.message}`);
   }
-  if (twse.status === 'rejected' && mis.status === 'rejected' && histRwd.status === 'rejected') {
+  if (twse.status === 'rejected' && histRwd.status === 'rejected') {
     throw twse.reason;
   }
   return {
     status: 'nodata',
-    certain: twse.status === 'fulfilled' && mis.status === 'fulfilled' && histRwd.status === 'fulfilled',
+    certain: twse.status === 'fulfilled' && histRwd.status === 'fulfilled',
   };
 }
 
@@ -319,7 +305,7 @@ async function main() {
         changed =
           apply(state, 'index', today, payload, nowIso, {
             source: r.source,
-            ...(r.source !== 'mis' && !hasOhlc ? { ohlcPending: true } : {}),
+            ...(!hasOhlc ? { ohlcPending: true } : {}),
           }) || changed;
         // 若這天先前被誤判為臨時休市，現在有資料就撤銷
         if (state.inferredClosed.includes(today)) {

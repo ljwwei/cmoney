@@ -7,13 +7,51 @@ import {
   parseFuturesCsv,
   parseIndex,
   parseInstitutional,
-  parseMisIndex,
   parseOpenApiIndexHist,
   parseTwseIndexHist,
+  parseBlockTradeScope,
 } from '../scripts/parsers.mjs';
+import {
+  isPending,
+  marginYi,
+  marginDiffYi,
+  toYiSigned,
+  resolveApiOrigin,
+  resolveLiveApiUrl,
+  inIntradayWindow,
+  getQuoteTimestampMs,
+  acceptLiveQuote,
+  selectIndexDisplay,
+  renderIndex,
+  indexBadge,
+  createLiveStreamController,
+  initVisitCounter,
+  FALLBACK_POLL_MS,
+} from '../js/app.js';
+import {
+  DEFAULT_SYMBOL,
+  YAHOO_TIMEOUT_MS,
+  WS_FAILOVER_RETRIES,
+  WS_INTRADAY_SILENCE_MS,
+  WS_RECOVERY_INTERVAL_MS,
+  WS_COOLDOWN_1013_MS,
+  IDLE_RELEASE_MS,
+  normalizeEpochMs,
+  withYahooCacheBuster,
+  shouldAcceptQuote,
+  parseFugleSnapshot,
+  parseFugleWsTick,
+  parseYahooBackup,
+  FugleHubEngine,
+  handleWorkerRequest,
+} from '../worker/core.mjs';
 
 // 以台北時間建立 Date
 const tpe = (s) => new Date(`${s}+08:00`);
+
+// ========================================================
+// 1. 排程與盤後解析（已移除證交所 MIS／鉅亨網）
+// ========================================================
 
 test('台北時間換算（跨日）', () => {
   assert.deepEqual(taipeiParts(new Date('2026-11-10T16:30:00Z')), { date: '2026-11-11', minutes: 30, dow: 3 });
@@ -54,14 +92,14 @@ test('已抓到當日資料就不再抓；三大法人在 20:00 後再抓一次�
   assert.deepEqual(dueTasks(s, tpe('2026-11-10T20:40:00')), []);
 });
 
-test('加權指數先取得即時行情值（mis），要等證交所正式資料確認；18:00 後不再追', () => {
+test('加權指數若僅有收盤價且 ohlcPending=true，持續重試至 18:00 為止', () => {
   const day = '2026-11-10';
-  const s = { closedDates: [], index: { date: day, source: 'mis' } };
+  const s = { closedDates: [], index: { date: day, source: 'twse', ohlcPending: true } };
   const hasIndex = (time) => dueTasks(s, tpe(`2026-11-10T${time}`)).includes('index');
   assert.equal(hasIndex('13:40:00'), true);
   assert.equal(hasIndex('17:59:00'), true);
   assert.equal(hasIndex('18:00:00'), false);
-  s.index.source = 'twse';
+  s.index.ohlcPending = false;
   assert.equal(hasIndex('13:40:00'), false);
 });
 
@@ -78,12 +116,12 @@ test('remainingTasks：今天還沒抓齊的項目（不論開始時間），供
   s.institutional.stage = 'with_block';
   s.margin = { date: day };
   assert.deepEqual(remainingTasks(s, tpe('2026-11-10T21:00:00')), []);
-  // 非交易日、13:00 前非盤後時段（例如凌晨/上午）、跨過當日截止時間 → 沒事了，不啟動輪詢
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T04:16:00')), []);
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T12:59:00')), []);
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-14T15:00:00')), []);
   assert.deepEqual(remainingTasks({ closedDates: [] }, tpe('2026-11-10T23:55:00')), []);
 });
+
 test('前一日的資料不算當日資料', () => {
   const s = { closedDates: [], index: { date: '2026-11-09' } };
   assert.deepEqual(dueTasks(s, tpe('2026-11-10T13:45:00')), ['index']);
@@ -130,27 +168,12 @@ test('加權指數漲跌正負號', () => {
   assert.deepEqual(parseIndex(mk('green', '-')), { close: 42711.92, change: -1050.22, changePct: -2.52 });
 });
 
-import {
-  isPending,
-  marginYi,
-  marginDiffYi,
-  toYiSigned,
-  resolveLiveApiUrl,
-  inIntradayWindow,
-  selectIndexDisplay,
-  renderIndex,
-  indexBadge,
-  acceptLiveQuote,
-  createLivePoller,
-  LIVE_POLL_MS,
-} from '../js/app.js';
-
 test('尚未揭露：交易日且資料日期早於今天才顯示', () => {
   const closed = ['2026-11-12'];
   assert.equal(isPending('2026-11-10', '2026-11-11', closed), true);
   assert.equal(isPending('2026-11-11', '2026-11-11', closed), false);
-  assert.equal(isPending('2026-11-11', '2026-11-12', closed), false); // 休市日不顯示
-  assert.equal(isPending('2026-11-13', '2026-11-14', closed), false); // 週六不顯示
+  assert.equal(isPending('2026-11-11', '2026-11-12', closed), false);
+  assert.equal(isPending('2026-11-13', '2026-11-14', closed), false);
 });
 
 test('融資與買賣超格式', () => {
@@ -159,22 +182,11 @@ test('融資與買賣超格式', () => {
   assert.equal(toYiSigned(-34116689906), '−341.17');
 });
 
-import { parseBlockTradeScope } from '../scripts/parsers.mjs';
-
 test('依證交所說明文字判斷是否含鉅額', () => {
   assert.equal(parseBlockTradeScope(['x', '本統計資訊含一般、零股、盤後定價、鉅額，不含拍賣、標購。']), true);
   assert.equal(parseBlockTradeScope(['本統計資訊含一般、零股、盤後定價，不含鉅額、拍賣、標購。']), false);
   assert.equal(parseBlockTradeScope(['其他說明']), null);
   assert.equal(parseBlockTradeScope(undefined), null);
-});
-
-test('即時行情 mis：收盤後（t ≥ 13:30）才算終盤值，漲跌以前收計算', () => {
-  const mk = (o) => ({ msgArray: [{ d: '20261111', t: '13:33:00', z: '44257.15', y: '42711.92', ...o }] });
-  assert.deepEqual(parseMisIndex(mk({}), '2026-11-11'), { close: 44257.15, change: 1545.23, changePct: 3.62 });
-  assert.equal(parseMisIndex(mk({ t: '13:29:55' }), '2026-11-11'), null); // 盤中
-  assert.equal(parseMisIndex(mk({ d: '20261110' }), '2026-11-11'), null); // 昨天的資料（今天休市）
-  assert.equal(parseMisIndex(mk({ z: '-' }), '2026-11-11'), null);
-  assert.equal(parseMisIndex({ msgArray: [] }, '2026-11-11'), null);
 });
 
 test('OpenAPI 加權指數歷史資料：民國日期、漲跌以前一筆計算', () => {
@@ -186,11 +198,11 @@ test('OpenAPI 加權指數歷史資料：民國日期、漲跌以前一筆計算
   assert.deepEqual(parseOpenApiIndexHist(list, '2026-11-10'), { close: 42711.92, change: null, changePct: null });
   assert.equal(parseOpenApiIndexHist(list, '2026-11-12'), null);
 });
+
 test('防呆：外資期貨整列全 0（期交所尚未提供正式資料）視為無資料', () => {
   const head = '日期,商品名稱,身份別,a,b,c,d,e,f,g,h,i,j,k,l';
   const zero = '2026/11/12,臺股期貨,外資及陸資,0,0,0,0,0,0,0,0,0,0,0,0';
   assert.equal(parseFuturesCsv([head, zero].join('\r\n'), '2026-11-12'), null);
-  // 多空未平倉都是 0 也不是正常資料
   const openZero = '2026/11/12,臺股期貨,外資及陸資,100,1,90,1,10,1,0,0,0,0,0,0';
   assert.equal(parseFuturesCsv([head, openZero].join('\r\n'), '2026-11-12'), null);
   const ok = '2026/11/12,臺股期貨,外資及陸資,86285,1,88046,1,-1761,1,9875,1,113348,1,-103473,1';
@@ -207,19 +219,7 @@ test('防呆：三大法人／融資全 0 視為無資料', () => {
   assert.equal(parseMargin({ stat: 'OK', tables: [{ data: [['融資金額(仟元)', '0', '0', '0', '0', '0']] }] }), null);
 });
 
-test('盤後解析擴充 OHLC：parseMisIndex / parseTwseIndexHist / parseOpenApiIndexHist', () => {
-  const mis = {
-    msgArray: [{ d: '20261113', t: '13:33:00', z: '43675.12', y: '43091.87', o: '43719.75', h: '44489.48', l: '43534.12' }],
-  };
-  assert.deepEqual(parseMisIndex(mis, '2026-11-13'), {
-    close: 43675.12,
-    change: 583.25,
-    changePct: 1.35,
-    open: 43719.75,
-    high: 44489.48,
-    low: 43534.12,
-  });
-
+test('盤後解析擴充 OHLC：parseTwseIndexHist / parseOpenApiIndexHist', () => {
   const histRwd = {
     stat: 'OK',
     data: [
@@ -250,24 +250,31 @@ test('盤後解析擴充 OHLC：parseMisIndex / parseTwseIndexHist / parseOpenAp
   });
 });
 
-test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', () => {
+// ========================================================
+// 2. 前端：UI 狀態（僅富果 / Yahoo 備援）、單調時間戳、SSE 單例、計次
+// ========================================================
+
+test('前端即時設定、盤中視窗、UI 標籤（僅保留富果盤中即時與 Yahoo 盤中即時備援）與單調時間戳', () => {
+  assert.equal(resolveApiOrigin({ metaContent: 'https://cmoney-taiex.example.workers.dev/api/taiex' }), 'https://cmoney-taiex.example.workers.dev');
   assert.equal(resolveLiveApiUrl({ metaContent: 'https://cmoney-taiex.example.workers.dev/' }), 'https://cmoney-taiex.example.workers.dev/api/taiex');
-  assert.equal(resolveLiveApiUrl({ search: '?liveApi=https://demo.workers.dev/api/taiex', metaContent: 'https://other.workers.dev' }), 'https://demo.workers.dev/api/taiex');
+  assert.equal(resolveLiveApiUrl({ search: '?liveApi=https://demo.workers.dev/api/stream', metaContent: 'https://other.workers.dev' }), 'https://demo.workers.dev/api/taiex');
   assert.equal(resolveLiveApiUrl({ search: '?liveApi=javascript:alert(1)' }), '');
   assert.equal(resolveLiveApiUrl({ search: '?liveApi=http://evil.example' }), '');
   assert.equal(resolveLiveApiUrl({ globalApi: 'http://localhost:8787' }), 'http://localhost:8787/api/taiex');
 
-  assert.equal(inIntradayWindow('2026-11-13', '08:58:59', []), false);
-  assert.equal(inIntradayWindow('2026-11-13', '09:05:10', []), true);
+  assert.equal(inIntradayWindow('2026-11-13', '08:54:59', []), false);
+  assert.equal(inIntradayWindow('2026-11-13', '08:55:00', []), true);
   assert.equal(inIntradayWindow('2026-11-13', '13:35:00', []), true);
   assert.equal(inIntradayWindow('2026-11-13', '13:35:01', []), false);
-  assert.equal(inIntradayWindow('2026-11-13', '10:00:00', ['2026-11-13']), false); // 休市日
-  assert.equal(inIntradayWindow('2026-11-15', '10:00:00', []), false); // 週日
+  assert.equal(inIntradayWindow('2026-11-13', '10:00:00', ['2026-11-13']), false);
+  assert.equal(inIntradayWindow('2026-11-15', '10:00:00', []), false);
 
+  const ts1 = tpe('2026-11-13T10:15:30').getTime();
   const prev = { date: '2026-11-12', close: 43091.87, change: -100, source: 'twse' };
-  const live = {
+  const fugleLive = {
     date: '2026-11-13',
     time: '10:15:30',
+    timestampMs: ts1,
     close: 43800.5,
     open: 43719.75,
     high: 44489.48,
@@ -275,10 +282,9 @@ test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', ()
     prevClose: 43091.87,
     change: 708.63,
     changePct: 1.64,
-    marketPhase: 'intraday',
-    source: 'mis',
-    fetchedAt: '2026-11-13T02:15:31Z',
+    source: 'fugle',
   };
+  const yahooLive = { ...fugleLive, source: 'yahoo' };
   const settled = {
     date: '2026-11-13',
     close: 43675.12,
@@ -288,170 +294,191 @@ test('前端即時設定解析、盤中視窗、資料合併與 OHLC 渲染', ()
     change: 583.25,
     changePct: 1.35,
     source: 'twse',
-    fetchedAt: '2026-11-13T05:46:25Z',
   };
 
-  assert.equal(selectIndexDisplay(prev, live, '2026-11-13'), live);
-  assert.equal(selectIndexDisplay(settled, live, '2026-11-13'), settled);
-  assert.equal(selectIndexDisplay(prev, { ...live, date: '2026-11-12' }, '2026-11-13'), prev);
+  assert.equal(selectIndexDisplay(prev, fugleLive, '2026-11-13'), fugleLive);
+  assert.equal(selectIndexDisplay(settled, fugleLive, '2026-11-13'), settled);
+  assert.equal(selectIndexDisplay(prev, { ...fugleLive, date: '2026-11-12' }, '2026-11-13'), prev);
 
-  const liveHtml = renderIndex(live);
+  const liveHtml = renderIndex(fugleLive);
   assert.ok(liveHtml.includes('開盤') && liveHtml.includes('43,719.75'));
   assert.ok(liveHtml.includes('最高') && liveHtml.includes('44,489.48'));
   assert.ok(liveHtml.includes('最低') && liveHtml.includes('43,000.00'));
   assert.ok(liveHtml.includes('ohlc__val down') && liveHtml.includes('ohlc__val up'));
-  assert.ok(liveHtml.includes('證交所盤中即時行情'));
+  assert.equal(/證交所盤中|鉅亨|即時終盤/.test(liveHtml), false);
 
-  const closedHtml = renderIndex(settled);
-  assert.ok(closedHtml.includes('開盤') && closedHtml.includes('43,719.75'));
-  assert.ok(closedHtml.includes('最高') && closedHtml.includes('44,489.48'));
-  assert.ok(closedHtml.includes('最低') && closedHtml.includes('43,534.12'));
-
-  assert.ok(indexBadge(live, '2026-11-13').includes('盤中即時'));
-  assert.ok(indexBadge({ ...live, source: 'yahoo_tw' }, '2026-11-13').includes('盤中即時'));
-  assert.ok(indexBadge({ ...live, marketPhase: 'closed', source: 'mis' }, '2026-11-13').includes('即時終盤'));
-  assert.ok(indexBadge(settled, '2026-11-13').includes('已收盤'));
+  // 嚴格僅保留兩種即時狀態標籤
+  assert.ok(indexBadge(fugleLive, '2026-11-13').includes('富果盤中即時'));
+  assert.ok(indexBadge(yahooLive, '2026-11-13').includes('Yahoo 盤中即時 (備援)'));
+  assert.equal(indexBadge(settled, '2026-11-13'), '');
   assert.equal(indexBadge(prev, '2026-11-13'), '');
 
-  const ytwHtml = renderIndex({ ...live, source: 'yahoo_tw' });
-  assert.ok(ytwHtml.includes('Yahoo 奇摩股市盤中即時'));
-  const cnyesHtml = renderIndex({ ...live, source: 'cnyes' });
-  assert.ok(cnyesHtml.includes('鉅亨網盤中即時'));
-
-  // 時間戳只往新不往回退，但同一日較舊快取仍可更新 fetchedAt
-  assert.equal(acceptLiveQuote(null, live), live);
-  assert.equal(acceptLiveQuote(live, { ...live, date: '2026-11-12' }), live);
-  const olderSameDay = acceptLiveQuote(live, { ...live, time: '10:15:10', close: 43750, fetchedAt: '2026-11-13T02:15:40Z' });
-  assert.equal(olderSameDay.close, 43800.5);
-  assert.equal(olderSameDay.time, '10:15:30');
-  assert.equal(olderSameDay.fetchedAt, '2026-11-13T02:15:40Z');
-  const newerTick = acceptLiveQuote(live, { ...live, time: '10:15:40', close: 43820 });
-  assert.equal(newerTick.close, 43820);
+  // 單調時間戳過濾：新報價時間戳必須嚴格 > latestQuoteTimestamp
+  assert.equal(getQuoteTimestampMs(fugleLive), ts1);
+  assert.equal(acceptLiveQuote(null, fugleLive, 0).close, 43800.5);
+  assert.equal(acceptLiveQuote(fugleLive, { ...fugleLive, timestampMs: ts1, close: 43700 }, ts1), fugleLive);
+  assert.equal(acceptLiveQuote(fugleLive, { ...fugleLive, timestampMs: ts1 - 1000, close: 43700 }, ts1), fugleLive);
+  const newer = acceptLiveQuote(fugleLive, { ...fugleLive, timestampMs: ts1 + 1000, close: 43888 }, ts1);
+  assert.equal(newer.close, 43888);
+  assert.equal(newer.timestampMs, ts1 + 1000);
 });
 
-test('前端即時輪詢：2.5 秒遞迴 setTimeout、請求結束才倒數、分頁隱藏暫停、切回立即抓取', async () => {
-  assert.equal(LIVE_POLL_MS, 2500);
+test('前端即時控制器：單例 EventSource、卸載 close()、SSE 故障改用遞迴 setTimeout(2.5s)+AbortController(2s)', async () => {
+  assert.equal(FALLBACK_POLL_MS, 2500);
+
+  const sockets = [];
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      this.closed = false;
+      this.listeners = new Map();
+      sockets.push(this);
+    }
+    addEventListener(type, fn) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(fn);
+    }
+    emit(type, payload = {}) {
+      for (const fn of this.listeners.get(type) || []) fn(payload);
+    }
+    close() {
+      this.closed = true;
+      this.readyState = 2;
+    }
+  }
 
   let nextId = 1;
-  const pending = new Map();
+  const timers = new Map();
   const setTimer = (fn, delay) => {
     const id = nextId++;
-    pending.set(id, { fn, delay });
+    timers.set(id, { fn, delay });
     return id;
   };
-  const clearTimer = (id) => pending.delete(id);
-  const only = () => {
-    assert.equal(pending.size, 1, 'exactly one pending timer');
-    return [...pending.values()][0];
-  };
-  const fireNext = async () => {
-    const [id, t] = [...pending.entries()][0];
-    pending.delete(id);
-    await t.fn();
-  };
+  const clearTimer = (id) => timers.delete(id);
 
   let hidden = false;
-  let runs = 0;
-  let release;
-  const poller = createLivePoller({
-    run: () => {
-      runs += 1;
-      return new Promise((resolve) => {
-        release = resolve;
-      });
-    },
+  const received = [];
+  const fetchLog = [];
+  const ctl = createLiveStreamController({
+    apiOrigin: 'https://cmoney-taiex.example.workers.dev',
     isHidden: () => hidden,
-    setTimer,
-    clearTimer,
-  });
-
-  // 啟動：立即（0ms）抓第一次
-  poller.start();
-  assert.equal(only().delay, 0);
-
-  // 第一次請求進行中：尚未排下一次（確保是「請求結束後才倒數」，不會堆疊）
-  const firstRun = fireNext();
-  assert.equal(runs, 1);
-  assert.equal(pending.size, 0);
-
-  // 請求結束 → 才排入 2.5 秒後的下一次
-  release();
-  await firstRun;
-  assert.equal(only().delay, 2500);
-
-  // 分頁隱藏 → 清掉計時器、停止抓取
-  hidden = true;
-  poller.onVisibilityChange();
-  assert.equal(pending.size, 0);
-
-  // 切回網頁 → 立即抓一次（0ms），之後恢復 2.5 秒間隔
-  hidden = false;
-  poller.onVisibilityChange();
-  assert.equal(only().delay, 0);
-  const secondRun = fireNext();
-  assert.equal(runs, 2);
-  release();
-  await secondRun;
-  assert.equal(only().delay, 2500);
-
-  // 請求進行中分頁被隱藏：結束後不再排程
-  const thirdRun = fireNext();
-  assert.equal(runs, 3);
-  hidden = true;
-  poller.onVisibilityChange();
-  release();
-  await thirdRun;
-  assert.equal(pending.size, 0);
-
-  // 單次請求丟出例外不會讓輪詢中斷
-  hidden = false;
-  const flaky = createLivePoller({
-    run: async () => {
-      throw new Error('boom');
+    EventSourceCtor: FakeEventSource,
+    fetchImpl: async (url, init) => {
+      fetchLog.push({ url, init });
+      return new Response(JSON.stringify({ ok: true, close: 43900, timestampMs: 1794792000000 }), { status: 200 });
     },
+    nowFn: () => 1794792000123,
     setTimer,
     clearTimer,
+    onQuote: (q) => received.push(q),
+    onError: () => {},
   });
-  flaky.start();
-  await fireNext();
-  assert.equal(only().delay, 2500);
-  flaky.stop();
-  assert.equal(pending.size, 0);
+
+  // 重複呼叫 start() 仍嚴格維持單例 EventSource
+  ctl.start();
+  ctl.start();
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].url, 'https://cmoney-taiex.example.workers.dev/api/stream');
+  assert.equal(ctl.isConnected(), true);
+
+  // 啟動當下也會送出 1 次防空白快照請求，且帶 _t= 時間戳、no-store 與 AbortSignal
+  assert.equal(fetchLog.length, 1);
+  assert.ok(fetchLog[0].url.endsWith('/api/taiex?_t=1794792000123'));
+  assert.equal(fetchLog[0].init.cache, 'no-store');
+  assert.ok(fetchLog[0].init.signal instanceof AbortSignal);
+
+  sockets[0].emit('quote', { data: JSON.stringify({ close: 43910, timestampMs: 1794792005000 }) });
+  assert.equal(received.at(-1).close, 43910);
+
+  // 分頁隱藏 -> 確實 close() 釋放連線；切回 -> 重新建立唯一一條
+  hidden = true;
+  ctl.onVisibilityChange();
+  assert.equal(sockets[0].closed, true);
+  assert.equal(ctl.isConnected(), false);
+
+  hidden = false;
+  ctl.onVisibilityChange();
+  assert.equal(sockets.length, 2);
+  assert.equal(ctl.isConnected(), true);
+
+  // SSE 連線中斷 -> 關閉舊 socket 並啟動遞迴 setTimeout(2500ms) + 15000ms SSE 重建排程
+  sockets[1].readyState = 2;
+  sockets[1].emit('error', new Error('sse dropped'));
+  assert.equal(sockets[1].closed, true);
+  assert.equal(ctl.isConnected(), false);
+  const delays = [...timers.values()].map((t) => t.delay);
+  assert.ok(delays.includes(0));
+  assert.ok(delays.includes(15000));
+
+  ctl.stop();
+  assert.equal(timers.size, 0);
 });
 
-import worker, {
-  parseMisLive,
-  parseYahooTwLive,
-  parseCnyesLive,
-  parseYahooLive,
-  pickFreshestQuote,
-  isWorkerIntradayWindow,
-  cacheTtlFor,
-  withCacheBuster,
-} from '../worker/worker.js';
-
-test('Cloudflare Worker：防快取時間戳、0.8 秒超時、2 秒共享快取與請求合併', async () => {
-  assert.equal(withCacheBuster('https://a.example/x?y=1', 123), 'https://a.example/x?y=1&_=123');
-  assert.equal(withCacheBuster('https://a.example/x;type=tick', 456), 'https://a.example/x;type=tick?_=456');
-  assert.equal(cacheTtlFor(tpe('2026-11-16T10:00:00')), 2); // 盤中 s-maxage = 2 秒
-  assert.equal(cacheTtlFor(tpe('2026-11-16T15:00:00')), 60); // 盤後
-  assert.equal(cacheTtlFor(tpe('2026-11-15T10:00:00')), 60); // 週日
+test('網站瀏覽人次計數（initVisitCounter）：呼叫 POST /api/stats/visits 並更新 #siteVisitCount', async () => {
+  const el = { textContent: '0' };
+  let called = null;
+  const count = await initVisitCounter({
+    apiOrigin: 'https://cmoney-taiex.example.workers.dev',
+    documentRef: { getElementById: (id) => (id === 'siteVisitCount' ? el : null) },
+    fetchImpl: async (url, init) => {
+      called = { url, init };
+      return new Response(JSON.stringify({ ok: true, visits: 12345 }), { status: 200 });
+    },
+  });
+  assert.equal(count, 12345);
+  assert.equal(el.textContent, '12,345');
+  assert.equal(called.url, 'https://cmoney-taiex.example.workers.dev/api/stats/visits');
+  assert.equal(called.init.method, 'POST');
+  assert.equal(called.init.cache, 'no-store');
 });
 
-test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層備援與陳舊快取保護', async () => {
-  // 1. 解析純函式驗證
-  assert.equal(parseMisLive({ msgArray: [{ d: '20261113', t: '09:00:00', z: '-', y: '43091.87' }] }), null);
-  const parsedMis = parseMisLive({
-    msgArray: [{ d: '20261113', t: '09:30:15', z: '43500.5', y: '43091.87', o: '43400', h: '43600', l: '43350' }],
-  });
-  assert.equal(parsedMis.marketPhase, 'intraday');
-  assert.equal(parsedMis.open, 43400);
-  assert.equal(parsedMis.change, 408.63);
+// ========================================================
+// 3. 後端 Worker（富果 WS 單例 + Yahoo 條件備援 + D1/SQLite 計次）
+// ========================================================
 
-  const parsedYtw = parseYahooTwLive([
+test('富果 REST 快照／WS 推播解析（微秒時間戳換算、OHLC 合併）與 Yahoo 備援解析', () => {
+  // 2026-11-16 09:20:55.000 Taipei = 2026-11-16T01:20:55Z -> 1794792055000 ms -> 1794792055000000 us
+  const us = 1794792055000000;
+  assert.equal(normalizeEpochMs(us), 1794792055000);
+  assert.equal(normalizeEpochMs(1794792055000), 1794792055000);
+  assert.equal(normalizeEpochMs(1794792055), 1794792055000);
+
+  const snap = parseFugleSnapshot({
+    symbol: DEFAULT_SYMBOL,
+    date: '2026-11-16',
+    previousClose: 43675.12,
+    openPrice: 43512.42,
+    highPrice: 43550.0,
+    lowPrice: 42595.92,
+    lastPrice: 42693.3,
+    lastUpdated: us,
+  });
+  assert.equal(snap.symbol, 'IX0001');
+  assert.equal(snap.date, '2026-11-16');
+  assert.equal(snap.time, '09:20:55');
+  assert.equal(snap.timestampMs, 1794792055000);
+  assert.equal(snap.change, -981.82);
+  assert.equal(snap.source, 'fugle');
+
+  // WS 推播跳升創新高（09:21:00）應沿用 open/prevClose 並更新 high
+  const tick = parseFugleWsTick(
+    { event: 'data', data: { symbol: 'IX0001', index: 43800.12, time: us + 5000000 } },
+    snap,
+    snap,
+  );
+  assert.equal(tick.time, '09:21:00');
+  assert.equal(tick.open, 43512.42);
+  assert.equal(tick.high, 43800.12);
+  assert.equal(tick.low, 42595.92);
+  assert.equal(tick.prevClose, 43675.12);
+  assert.equal(tick.source, 'fugle');
+
+  // Yahoo 備援解析
+  const ytw = parseYahooBackup([
     {
       chart: {
-        meta: { regularMarketTime: 1794792060, regularMarketPrice: 42693.3, previousClose: 43675.12 }, // 2026-11-16 09:21:00
+        meta: { regularMarketTime: 1794792060, regularMarketPrice: 42693.3, previousClose: 43675.12 },
         quote: {
           price: '42693.30',
           previousClose: '43675.12',
@@ -459,32 +486,22 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
           dayHighPrice: '43512.42',
           dayLowPrice: '42595.92',
           marketStatus: 'open',
-          refreshedTs: '2026-11-16T01:20:55Z', // 09:20:55 +08:00
+          refreshedTs: '2026-11-16T01:20:55Z',
         },
       },
     },
   ]);
-  assert.equal(parsedYtw.date, '2026-11-16');
-  assert.equal(parsedYtw.time, '09:20:55');
-  assert.equal(parsedYtw.close, 42693.3);
-  assert.equal(parsedYtw.open, 43512.42);
-  assert.equal(parsedYtw.source, 'yahoo_tw');
+  assert.equal(ytw.source, 'yahoo');
+  assert.equal(ytw.time, '09:20:55');
 
-  const parsedCnyes = parseCnyesLive({
-    data: [{ 6: 42768.12, 12: 43512.42, 13: 42595.92, 19: 43512.42, 21: 43675.12, 200007: 1794791930 }],
-  });
-  assert.equal(parsedCnyes.date, '2026-11-16');
-  assert.equal(parsedCnyes.time, '09:18:50');
-  assert.equal(parsedCnyes.source, 'cnyes');
-
-  const parsedYahoo = parseYahooLive({
+  const yv8 = parseYahooBackup({
     chart: {
       result: [
         {
           meta: {
             regularMarketPrice: 43675.12,
             previousClose: 43091.9,
-            regularMarketTime: 1794547995, // 2026-11-13 13:33:15 +08:00
+            regularMarketTime: 1794547995,
             regularMarketDayHigh: 44489.48,
             regularMarketDayLow: 43534.12,
           },
@@ -493,303 +510,343 @@ test('Cloudflare Worker：多源盤中搶鮮競速、Cache API 去重、多層�
       ],
     },
   });
-  assert.equal(parsedYahoo.date, '2026-11-13');
-  assert.equal(parsedYahoo.open, 43719.75);
-  assert.equal(parsedYahoo.source, 'yahoo');
+  assert.equal(yv8.source, 'yahoo');
+  assert.equal(yv8.open, 43719.75);
 
-  // 競速排序：較新時間優先，同分秒以官方 MIS 優先
-  const misLag = { ok: true, date: '2026-11-16', time: '09:20:00', close: 42775, source: 'mis' };
-  const ytwFresh = { ok: true, date: '2026-11-16', time: '09:20:55', close: 42693, source: 'yahoo_tw' };
-  assert.equal(pickFreshestQuote([misLag, ytwFresh]).source, 'yahoo_tw');
-  const misTie = { ok: true, date: '2026-11-16', time: '09:20:55', close: 42693, source: 'mis' };
-  assert.equal(pickFreshestQuote([ytwFresh, misTie]).source, 'mis');
+  assert.equal(shouldAcceptQuote(1794792055000, { close: 43800, timestampMs: 1794792055000 }), false);
+  assert.equal(shouldAcceptQuote(1794792055000, { close: 43800, timestampMs: 1794792056000 }), true);
+  assert.equal(withYahooCacheBuster('https://tw.stock.yahoo.com/a;type=tick', 999), 'https://tw.stock.yahoo.com/a;type=tick?_c=1&_=999');
+});
 
-  assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T10:00:00')), true);
-  assert.equal(isWorkerIntradayWindow(tpe('2026-11-13T13:36:00')), false);
-  assert.equal(isWorkerIntradayWindow(tpe('2026-11-15T10:00:00')), false);
+function createVirtualTimers(initialNowMs) {
+  let now = initialNowMs;
+  let nextId = 1;
+  const timeouts = new Map();
+  const intervals = new Map();
 
-  const originalFetch = globalThis.fetch;
-  const originalCaches = globalThis.caches;
+  const setTimeoutFn = (fn, delay) => {
+    const id = nextId++;
+    timeouts.set(id, { fn, runAt: now + Math.max(0, Number(delay) || 0) });
+    return id;
+  };
+  const clearTimeoutFn = (id) => timeouts.delete(id);
 
-  const cacheStore = new Map();
-  globalThis.caches = {
-    default: {
-      async match(key) {
-        const hit = cacheStore.get(String(key));
-        return hit ? hit.clone() : undefined;
-      },
-      async put(key, res) {
-        cacheStore.set(String(key), res.clone());
-      },
+  const setIntervalFn = (fn, delay) => {
+    const id = nextId++;
+    const step = Math.max(1, Number(delay) || 1);
+    intervals.set(id, { fn, step, runAt: now + step });
+    return id;
+  };
+  const clearIntervalFn = (id) => intervals.delete(id);
+
+  const advance = async (ms) => {
+    const target = now + ms;
+    while (true) {
+      let earliest = null;
+      for (const [id, t] of timeouts) {
+        if (t.runAt <= target && (!earliest || t.runAt < earliest.runAt)) earliest = { kind: 't', id, ...t };
+      }
+      for (const [id, iv] of intervals) {
+        if (iv.runAt <= target && (!earliest || iv.runAt < earliest.runAt)) earliest = { kind: 'i', id, ...iv };
+      }
+      if (!earliest) break;
+      now = earliest.runAt;
+      if (earliest.kind === 't') {
+        timeouts.delete(earliest.id);
+        await earliest.fn();
+      } else {
+        const cur = intervals.get(earliest.id);
+        if (cur) {
+          cur.runAt = now + cur.step;
+          await cur.fn();
+        }
+      }
+    }
+    now = target;
+  };
+
+  return {
+    nowFn: () => now,
+    setTimeoutFn,
+    clearTimeoutFn,
+    setIntervalFn,
+    clearIntervalFn,
+    advance,
+  };
+}
+
+class MockWsSocket {
+  constructor() {
+    this.sent = [];
+    this.listeners = new Map();
+    this.closedWith = null;
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(fn);
+  }
+  send(data) {
+    this.sent.push(JSON.parse(data));
+  }
+  close(code, reason) {
+    this.closedWith = { code, reason };
+  }
+  emitMessage(obj) {
+    for (const fn of this.listeners.get('message') || []) fn({ data: JSON.stringify(obj) });
+  }
+  emitClose(code) {
+    for (const fn of this.listeners.get('close') || []) fn({ code });
+  }
+}
+
+test('FugleHubEngine：單例 WebSocket（禁開第 2 條）、Yahoo 完全休眠、3 次斷線備援、15 秒回復與 1013 冷卻', async () => {
+  assert.equal(YAHOO_TIMEOUT_MS, 2000);
+  assert.equal(WS_FAILOVER_RETRIES, 3);
+  assert.equal(WS_INTRADAY_SILENCE_MS, 12000);
+  assert.equal(WS_RECOVERY_INTERVAL_MS, 15000);
+  assert.equal(WS_COOLDOWN_1013_MS, 15000);
+
+  const vt = createVirtualTimers(tpe('2026-11-16T10:00:00').getTime());
+  const createdSockets = [];
+  let yahooCalls = 0;
+  let yahooPrice = 42750;
+  let snapshotPrice = 42693.3;
+
+  const hub = new FugleHubEngine({
+    env: { FUGLE_API_KEY: 'secret-test-key' },
+    nowFn: vt.nowFn,
+    setTimeoutFn: vt.setTimeoutFn,
+    clearTimeoutFn: vt.clearTimeoutFn,
+    setIntervalFn: vt.setIntervalFn,
+    clearIntervalFn: vt.clearIntervalFn,
+    connectWsImpl: async () => {
+      const s = new MockWsSocket();
+      createdSockets.push(s);
+      return s;
+    },
+    fetchImpl: async (url, init) => {
+      const u = String(url);
+      if (u.includes('api.fugle.tw/marketdata/v1.0/stock/intraday/quote/IX0001')) {
+        assert.equal(init.headers['X-API-KEY'], 'secret-test-key');
+        return new Response(
+          JSON.stringify({
+            symbol: 'IX0001',
+            date: '2026-11-16',
+            previousClose: 43675.12,
+            openPrice: 43512.42,
+            highPrice: 43550,
+            lowPrice: 42595.92,
+            lastPrice: snapshotPrice,
+            lastUpdated: vt.nowFn() * 1000,
+          }),
+          { status: 200 },
+        );
+      }
+      if (u.includes('yahoo.com')) {
+        yahooCalls += 1;
+        assert.match(u, /[?&]_=\d+/);
+        assert.ok(init.signal instanceof AbortSignal);
+        return new Response(
+          JSON.stringify({
+            chart: {
+              result: [
+                {
+                  meta: {
+                    regularMarketPrice: yahooPrice,
+                    previousClose: 43675.12,
+                    regularMarketTime: Math.floor(vt.nowFn() / 1000),
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error('Unexpected fetch: ' + u);
+    },
+  });
+
+  // 1. 同時多次啟動仍嚴格只開 1 條 WS、完成 Snapshot + auth + subscribe，且 Yahoo 保持 0 請求（完全休眠）
+  await Promise.all([hub.ensureStarted(), hub.ensureStarted()]);
+  assert.equal(createdSockets.length, 1);
+  assert.equal(hub.latestQuote.close, 42693.3);
+  assert.equal(yahooCalls, 0);
+
+  const ws1 = createdSockets[0];
+  assert.deepEqual(ws1.sent[0], { event: 'auth', data: { apikey: 'secret-test-key' } });
+  ws1.emitMessage({ event: 'authenticated' });
+  assert.deepEqual(ws1.sent[1], { event: 'subscribe', data: { channel: 'indices', symbol: 'IX0001' } });
+  ws1.emitMessage({ event: 'subscribed' });
+  ws1.emitMessage({ event: 'data', data: { symbol: 'IX0001', index: 42710.5, time: (vt.nowFn() + 1000) * 1000 } });
+  assert.equal(hub.latestQuote.close, 42710.5);
+  assert.equal(yahooCalls, 0);
+
+  // 單調時間戳保護：更舊的時間戳不覆蓋最新價
+  ws1.emitMessage({ event: 'data', data: { symbol: 'IX0001', index: 42600, time: vt.nowFn() * 1000 } });
+  assert.equal(hub.latestQuote.close, 42710.5);
+
+  // 2. 斷線重連防抖：第 1、2 次失敗不切 Yahoo，第 3 次失敗才進入 Yahoo 備援
+  ws1.emitClose(1006);
+  assert.equal(hub.mode, 'fugle');
+  assert.equal(yahooCalls, 0);
+  await vt.advance(3000);
+  assert.equal(createdSockets.length, 2);
+
+  createdSockets[1].emitClose(1006);
+  assert.equal(hub.mode, 'fugle');
+  assert.equal(yahooCalls, 0);
+  await vt.advance(3000);
+  assert.equal(createdSockets.length, 3);
+
+  createdSockets[2].emitClose(1006);
+  assert.equal(hub.mode, 'yahoo');
+  await vt.advance(10); // 讓即時 Yahoo 首次抓取完成
+  assert.equal(yahooCalls, 1);
+  assert.equal(hub.latestQuote.source, 'yahoo');
+  assert.equal(hub.latestQuote.close, 42750);
+
+  // 3. 進入 Yahoo 後，每 15 秒背景嘗試重建 Fugle WS，收到有效推播立刻停 Yahoo 回切 Fugle
+  snapshotPrice = 42810;
+  await vt.advance(15000);
+  assert.equal(createdSockets.length, 4);
+  const ws4 = createdSockets[3];
+  ws4.emitMessage({ event: 'authenticated' });
+  ws4.emitMessage({ event: 'subscribed' });
+  ws4.emitMessage({ event: 'data', data: { symbol: 'IX0001', index: 42825, time: (vt.nowFn() + 2000) * 1000 } });
+  assert.equal(hub.mode, 'fugle');
+  assert.equal(hub.latestQuote.source, 'fugle');
+  assert.equal(hub.latestQuote.close, 42825);
+  const yahooAfterRecovery = yahooCalls;
+
+  // 確認 Yahoo 輪詢確實已停止
+  await vt.advance(5000);
+  assert.equal(yahooCalls, yahooAfterRecovery);
+
+  // 4. 盤中靜默超過 12 秒（先於 8 秒主動送 ping）：仍無回應時切入 Yahoo 備援
+  await vt.advance(4000); // 距上次活動 ~9 秒 -> 應發送 ping
+  assert.ok(ws4.sent.some((m) => m.event === 'ping'));
+  await vt.advance(6000); // 超過 12 秒靜默
+  assert.equal(hub.mode, 'yahoo');
+  assert.equal(hub.backupReason, 'intraday_silence_12s');
+
+  // 5. Close Code 1013 冷卻保護：遭遇 1013 後至少 15 秒內禁止再開 WS
+  hub.exitYahooBackupToFugle();
+  assert.equal(await hub.connectFugle(), true);
+  const ws5 = createdSockets.at(-1);
+  const countBefore1013 = createdSockets.length;
+  ws5.emitClose(1013);
+  assert.equal(hub.mode, 'yahoo');
+  assert.equal(await hub.connectFugle(), false);
+  assert.equal(createdSockets.length, countBefore1013);
+
+  // 6. SSE 連線全部離開超過 30 秒 → 主動關閉資源
+  const closedEvents = [];
+  const sseClient = { write() {}, close: () => closedEvents.push('closed') };
+  hub.addSseClient(sseClient);
+  hub.removeSseClient(sseClient);
+  await vt.advance(IDLE_RELEASE_MS + 100);
+  assert.equal(hub.yahooPollTimer, null);
+  assert.equal(hub.recoveryTimer, null);
+  assert.equal(hub.healthTimer, null);
+});
+
+test('無 FUGLE_API_KEY 時直接啟用 Yahoo 備援；D1 與 DO SQLite 人數計次正常累加', async () => {
+  // 1. 無 API Key 直接 Yahoo 備援
+  let yahooCalls = 0;
+  const noKeyHub = new FugleHubEngine({
+    env: {},
+    fetchImpl: async (url) => {
+      yahooCalls += 1;
+      assert.ok(String(url).includes('yahoo.com'));
+      return new Response(
+        JSON.stringify({
+          chart: { result: [{ meta: { regularMarketPrice: 43100, previousClose: 43000, regularMarketTime: 1794792060 } }] },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  await noKeyHub.ensureStarted();
+  assert.equal(noKeyHub.mode, 'yahoo');
+  assert.equal(noKeyHub.backupReason, 'no_api_key');
+  assert.equal(yahooCalls, 1);
+  noKeyHub.shutdownIdle();
+
+  // 2. DO SQLite 備援計次 + /api/stats/visits + /health
+  const store = new Map();
+  const mockSql = {
+    exec(sql, ...args) {
+      if (sql.startsWith('INSERT OR IGNORE')) {
+        if (!store.has(args[0])) store.set(args[0], args[1]);
+        return [];
+      }
+      if (sql.startsWith('UPDATE')) {
+        const key = args[1];
+        store.set(key, (store.get(key) || 0) + 1);
+        return [];
+      }
+      if (sql.startsWith('SELECT value')) {
+        return [{ value: store.get(args[0]) ?? 0 }];
+      }
+      return [];
+    },
+  };
+  const doEngine = new FugleHubEngine({ env: { FUGLE_API_KEY: 'k' }, sql: mockSql });
+  const envWithDo = {
+    FUGLE_API_KEY: 'k',
+    FUGLE_HUB: {
+      idFromName: () => 'singleton-id',
+      get: () => ({
+        fetch: (req) => doEngine.handleFetch(req),
+      }),
     },
   };
 
-  let upstreamCalls = 0;
-  let mode = 'ytw_freshest';
-  let delayMs = 0;
-  const upstreamLog = [];
+  const v1 = await handleWorkerRequest(
+    new Request('https://w.example/api/stats/visits', { method: 'POST', headers: { Origin: 'https://ljwwei.github.io' } }),
+    envWithDo,
+  );
+  assert.equal((await v1.json()).visits, 1);
+  const v2 = await handleWorkerRequest(
+    new Request('https://w.example/api/stats/visits', { method: 'POST', headers: { Origin: 'https://ljwwei.github.io' } }),
+    envWithDo,
+  );
+  assert.equal((await v2.json()).visits, 2);
 
-  const waitAbortable = (ms, signal) =>
-    new Promise((resolve, reject) => {
-      if (!ms) return resolve();
-      const onAbort = () => {
-        clearTimeout(t);
-        reject(signal.reason);
+  // 3. D1 計次優先路徑
+  let d1Count = 99;
+  const mockD1 = {
+    prepare(sql) {
+      return {
+        bind: (...args) => ({
+          run: async () => {
+            if (sql.startsWith('UPDATE')) {
+              d1Count += 1;
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          },
+          first: async () => ({ value: d1Count }),
+        }),
+        run: async () => ({ meta: { changes: 0 } }),
       };
-      const t = setTimeout(() => {
-        signal?.removeEventListener('abort', onAbort);
-        resolve();
-      }, ms);
-      signal?.addEventListener('abort', onAbort, { once: true });
-    });
-
-  const hangOnSignal = (signal) =>
-    new Promise((_, reject) => {
-      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-    });
-
-  let yahooGlobalCalls = 0;
-
-  globalThis.fetch = async (url, init = {}) => {
-    upstreamCalls += 1;
-    const u = String(url);
-    upstreamLog.push({ url: u, init });
-    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
-    if (u.includes('tw.stock.yahoo.com')) {
-      if (mode === 'all_hang') return hangOnSignal(init.signal);
-      if (mode === 'cold_grace') await waitAbortable(920, init.signal);
-      else if (mode !== 'ytw_freshest' && mode !== 'mis_hang') return new Response('Err', { status: 503 });
-      return new Response(
-        JSON.stringify([
-          {
-            chart: {
-              meta: { regularMarketTime: 1794536460, regularMarketPrice: 43888, previousClose: 43091.87 }, // 2026-11-13 10:21:00
-              quote: {
-                price: '43888',
-                previousClose: '43091.87',
-                openPrice: '43719.75',
-                dayHighPrice: '43920',
-                dayLowPrice: '43600',
-                marketStatus: 'open',
-                refreshedTs: '2026-11-13T02:20:55Z', // 10:20:55
-              },
-            },
-          },
-        ]),
-        { status: 200 },
-      );
-    }
-    if (u.includes('ws.api.cnyes.com')) {
-      if (mode === 'all_hang') return hangOnSignal(init.signal);
-      if (mode === 'mis_only' || mode === 'yahoo_backup' || mode === 'all_fail' || mode === 'cold_grace') {
-        return new Response('Err', { status: 503 });
-      }
-      return new Response(
-        JSON.stringify({
-          data: [{ 6: 43850, 12: 43900, 13: 43600, 19: 43719.75, 21: 43091.87, 200007: 1794536430 }], // 10:20:30
-        }),
-        { status: 200 },
-      );
-    }
-    if (u.includes('mis.twse.com.tw')) {
-      if (mode === 'mis_hang' || mode === 'cold_grace' || mode === 'all_hang') {
-        // 模擬證交所掛住不回應：只有被 AbortSignal 超時中止才會結束
-        return hangOnSignal(init.signal);
-      }
-      if (mode === 'yahoo_backup' || mode === 'all_fail') {
-        return new Response('Forbidden', { status: 403 });
-      }
-      return new Response(
-        JSON.stringify({
-          msgArray: [{ d: '20261113', t: '10:20:00', z: '43800', y: '43091.87', o: '43719.75', h: '43900', l: '43600' }],
-        }),
-        { status: 200 },
-      );
-    }
-    if (u.includes('query1.finance.yahoo.com')) {
-      yahooGlobalCalls += 1;
-      if (mode === 'all_fail' || mode === 'all_hang') return new Response('Err', { status: 503 });
-      return new Response(
-        JSON.stringify({
-          chart: {
-            result: [
-              {
-                meta: {
-                  regularMarketPrice: 43810,
-                  previousClose: 43091.87,
-                  regularMarketTime: 1794536400, // 2026-11-13 10:20:00 +08:00
-                  regularMarketDayHigh: 43900,
-                  regularMarketDayLow: 43600,
-                },
-                indicators: { quote: [{ open: [43719.75] }] },
-              },
-            ],
-          },
-        }),
-        { status: 200 },
-      );
-    }
-    throw new Error('Unexpected fetch url: ' + u);
+    },
   };
+  const d1Res = await handleWorkerRequest(
+    new Request('https://w.example/api/stats/visits', { method: 'POST', headers: { Origin: 'https://ljwwei.github.io' } }),
+    { DB: mockD1 },
+  );
+  assert.equal(d1Res.status, 200);
+  assert.equal(d1Res.headers.get('Access-Control-Allow-Origin'), 'https://ljwwei.github.io');
+  assert.equal((await d1Res.json()).visits, 100);
 
-  try {
-    // CORS preflight
-    const preflightAllowed = await worker.fetch(
-      new Request('https://taiex.example/api/taiex', {
-        method: 'OPTIONS',
-        headers: { Origin: 'https://ljwwei.github.io' },
-      }),
-      {},
-    );
-    assert.equal(preflightAllowed.status, 204);
-    assert.equal(preflightAllowed.headers.get('Access-Control-Allow-Origin'), 'https://ljwwei.github.io');
-
-    const preflightDenied = await worker.fetch(
-      new Request('https://taiex.example/api/taiex', {
-        method: 'OPTIONS',
-        headers: { Origin: 'https://untrusted.example' },
-      }),
-      {},
-    );
-    assert.equal(preflightDenied.headers.get('Access-Control-Allow-Origin'), null);
-
-    // Health check
-    const healthRes = await worker.fetch(new Request('https://taiex.example/health'), {});
-    assert.equal(healthRes.status, 200);
-    assert.equal((await healthRes.json()).ok, true);
-
-    // 搶鮮挑選時間最新的 yahoo_tw (10:20:55 勝過 mis 10:20:00)，且不讓瀏覽器自行快取
-    const r1 = await worker.fetch(
-      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
-      {},
-    );
-    assert.equal(r1.status, 200);
-    const j1 = await r1.json();
-    assert.equal(j1.source, 'yahoo_tw');
-    assert.equal(j1.time, '10:20:55');
-    assert.equal(j1.close, 43888);
-    assert.equal(upstreamCalls, 3);
-
-    // 三個上游請求都必須：URL 帶 _= 時間戳、cf 禁快取、Cache-Control: no-cache、有 abort signal
-    assert.equal(upstreamLog.length, 3);
-    for (const call of upstreamLog) {
-      assert.match(call.url, /[?&]_=\d{13}(?:&|$)/, `missing cache-buster: ${call.url}`);
-      assert.deepEqual(call.init.cf, { cacheTtl: 0, cacheEverything: false });
-      assert.equal(call.init.headers['Cache-Control'], 'no-cache');
-      assert.ok(call.init.signal instanceof AbortSignal);
-    }
-    assert.ok(upstreamLog.some((c) => c.url.includes('tw.stock.yahoo.com')));
-    assert.ok(upstreamLog.some((c) => c.url.includes('ws.api.cnyes.com')));
-    assert.ok(upstreamLog.some((c) => c.url.includes('mis.twse.com.tw')));
-
-    // 回應標頭：共享快取 s-maxage 與 TTL 一致（盤中 2 秒／盤後 60 秒），瀏覽器 max-age=0
-    assert.equal(r1.headers.get('Cache-Control'), `public, max-age=0, s-maxage=${cacheTtlFor()}`);
-
-    // /api/quote 為 /api/taiex 的別名；仍命中邊緣快取，不增加上游請求
-    const rQuote = await worker.fetch(new Request('https://taiex.example/api/quote?_t=1'), {});
-    assert.equal(rQuote.status, 200);
-    assert.equal((await rQuote.json()).source, 'yahoo_tw');
-    assert.equal(upstreamCalls, 3);
-
-    // 快取過期瞬間湧入 5 個請求：同一 isolate 只會合併成「一輪」三源抓取
-    cacheStore.clear();
-    delayMs = 30;
-    const beforeBurst = upstreamCalls;
-    const burst = await Promise.all(
-      Array.from({ length: 5 }, () => worker.fetch(new Request('https://taiex.example/api/taiex'), {})),
-    );
-    delayMs = 0;
-    assert.equal(upstreamCalls - beforeBurst, 3, 'concurrent misses must share one upstream round');
-    for (const res of burst) assert.equal((await res.json()).source, 'yahoo_tw');
-    upstreamLog.length = 0;
-    const callsAfterBurst = upstreamCalls;
-
-    const r2 = await worker.fetch(
-      new Request('https://taiex.example/api/taiex?t=cachebust', { headers: { Origin: 'http://localhost:8080' } }),
-      {},
-    );
-    assert.equal(r2.status, 200);
-    assert.equal(r2.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
-    assert.equal(upstreamCalls, callsAfterBurst, 'Cache API hit must reuse edge cache across allowed origins');
-
-    // Yahoo TW 失敗 -> Cnyes (10:20:30) 自動補上搶鮮
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'cnyes_freshest';
-    const rCnyes = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    assert.equal((await rCnyes.json()).source, 'cnyes');
-
-    // Yahoo TW & Cnyes 失敗 -> MIS (10:20:00) 正常接手
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'mis_only';
-    const rMis = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    assert.equal((await rMis.json()).source, 'mis');
-
-    // 證交所掛住不回應：0.8 秒超時直接略過，立刻用 Yahoo 奇摩 / 鉅亨網已取得的資料回傳（不會被拖到 1.4 秒以上）
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'mis_hang';
-    const keepAlive = setInterval(() => {}, 20); // AbortSignal.timeout 的計時器不會維持 event loop，測試需自行保活
-    const hangStart = Date.now();
-    const rHang = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    const hangElapsed = Date.now() - hangStart;
-    clearInterval(keepAlive);
-    const jHang = await rHang.json();
-    assert.equal(jHang.source, 'yahoo_tw');
-    assert.equal(jHang.time, '10:20:55');
-    assert.ok(hangElapsed >= 700 && hangElapsed < 1400, `expected ~800ms timeout, got ${hangElapsed}ms`);
-
-    // 方案 1 冷啟動寬限測試：800ms 時三家皆無回傳（Cnyes 錯、MIS 掛住、Yahoo TW 于 ~920ms 回來）→ 不截斷，搶第一家回來就立刻回傳
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'cold_grace';
-    const graceStart = Date.now();
-    const rGrace = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    const graceElapsed = Date.now() - graceStart;
-    const jGrace = await rGrace.json();
-    assert.equal(rGrace.status, 200);
-    assert.equal(jGrace.source, 'yahoo_tw');
-    assert.ok(graceElapsed >= 850 && graceElapsed < 1450, `expected ~920ms grace finish, got ${graceElapsed}ms`);
-
-    // 方案 1 滿 1800ms 全掛住：直接中止且不再串行補等 Yahoo Global 800ms，立刻退回陳舊快取
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'all_hang';
-    const ygBefore = yahooGlobalCalls;
-    const hardStart = Date.now();
-    const rHard = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    const hardElapsed = Date.now() - hardStart;
-    const jHard = await rHard.json();
-    assert.equal(rHard.status, 200);
-    assert.equal(jHard.stale, true);
-    assert.equal(yahooGlobalCalls, ygBefore, 'must skip sequential Yahoo Global after 1800ms hard cap');
-    assert.ok(hardElapsed >= 1700 && hardElapsed < 2300, `expected ~1800ms hard cap, got ${hardElapsed}ms`);
-
-    // 前三者全失敗 -> Yahoo 全域備援
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'yahoo_backup';
-    const r3 = await worker.fetch(
-      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
-      {},
-    );
-    assert.equal(r3.status, 200);
-    const j3 = await r3.json();
-    assert.equal(j3.source, 'yahoo');
-    assert.equal(j3.close, 43810);
-
-    // Clear live cache -> simulate all upstreams failing -> return stale cache gracefully
-    cacheStore.delete('https://cache.cmoney.local/api/taiex-v2');
-    mode = 'all_fail';
-    const r4 = await worker.fetch(
-      new Request('https://taiex.example/api/taiex', { headers: { Origin: 'https://ljwwei.github.io' } }),
-      {},
-    );
-    assert.equal(r4.status, 200);
-    const j4 = await r4.json();
-    assert.equal(j4.stale, true);
-
-    // No stale cache either -> 502
-    cacheStore.clear();
-    const r5 = await worker.fetch(new Request('https://taiex.example/api/taiex'), {});
-    assert.equal(r5.status, 502);
-  } finally {
-    globalThis.fetch = originalFetch;
-    globalThis.caches = originalCaches;
-  }
+  // 4. /health 回報主備來源與設定狀態（絕不外洩 API Key 本身）
+  const hRes = await handleWorkerRequest(new Request('https://w.example/health'), envWithDo);
+  const hJson = await hRes.json();
+  assert.equal(hJson.primary, 'fugle');
+  assert.equal(hJson.backup, 'yahoo');
+  assert.equal(hJson.hasFugleKey, true);
+  assert.equal(hJson.hasDurableHub, true);
+  assert.equal(JSON.stringify(hJson).includes('secret'), false);
 });

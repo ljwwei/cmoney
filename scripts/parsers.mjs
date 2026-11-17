@@ -32,34 +32,6 @@ export function parseIndex(json) {
 }
 
 /**
- * 證交所即時行情 mis getStockInfo（ex_ch=tse_t00.tw，加權指數）。
- * 13:30 收盤後，最後一筆（t ≥ 13:30:00）即為終盤指數；y 為前一交易日收盤；o/h/l 為開盤/最高/最低。
- * 回傳 null 代表：不是指定日期的資料、尚未收盤、或欄位缺漏。
- * @param {object} json mis 回傳
- * @param {string} date YYYY-MM-DD
- */
-export function parseMisIndex(json, date) {
-  const item = json?.msgArray?.[0];
-  if (!item || item.d !== date.replace(/-/g, '')) return null;
-  if (String(item.t ?? '') < '13:30:00') return null; // 盤中即時值，不是收盤
-  const close = num(item.z);
-  const prev = num(item.y);
-  if (!Number.isFinite(close) || !Number.isFinite(prev) || prev <= 0) return null;
-  const open = num(item.o);
-  const high = num(item.h);
-  const low = num(item.l);
-  const change = +(close - prev).toFixed(2);
-  return {
-    close,
-    change,
-    changePct: +((change / prev) * 100).toFixed(2),
-    ...(open > 0 ? { open } : {}),
-    ...(high > 0 ? { high } : {}),
-    ...(low > 0 ? { low } : {}),
-  };
-}
-
-/**
  * 證交所盤後日統計 /indicesReport/MI_5MINS_HIST（含單日開盤、最高、最低、收盤指數）。
  * 支援依指定日期回溯歷史或當日收盤 OHLC。
  */

@@ -7,7 +7,7 @@ export const TASKS = ['index', 'futures', 'institutional', 'margin'];
 // 到時間後，由常駐輪詢（見 update.yml）每 30 秒檢查一次，直到抓到為止；
 // 提早開始只是多幾次「尚無資料」的查詢，不會有副作用。
 export const START_AT = {
-  index: 13 * 60 + 30, // 加權指數：13:30 收盤後（即時行情 13:33 即有終盤值）
+  index: 13 * 60 + 30, // 加權指數：13:30 收盤後
   futures: 14 * 60 + 30, // 外資期貨未平倉
   institutional: 14 * 60 + 30, // 三大法人（不含鉅額）
   institutionalBlock: 20 * 60, // 三大法人（含鉅額）：20:00 後
@@ -17,8 +17,7 @@ export const START_AT = {
 // 交易日、但加權指數到這個時間仍「確定無資料」時，推斷為臨時休市（颱風、天災等）
 export const INFER_CLOSED_AT = 16 * 60;
 
-// 加權指數若先取得的是即時行情終盤值（source = 'mis'），要等證交所盤後正式資料來確認；
-// 超過這個時間仍未取得正式資料，就以即時行情值為準、不再追。
+// 加權指數若先取得收盤價但 OHLC 尚未齊全（ohlcPending），超過這個時間不再重試
 export const INDEX_CONFIRM_UNTIL = 18 * 60;
 
 // 當日開始輪詢的最早時間（台北時間 13:00）。
@@ -54,7 +53,7 @@ export function isTradingDay(dateStr, closedDates = []) {
 function isDone(task, state, today, minutes) {
   const d = state[task];
   if (d?.date !== today) return false;
-  if (task === 'index') return (d.source !== 'mis' && !d.ohlcPending) || minutes >= INDEX_CONFIRM_UNTIL;
+  if (task === 'index') return !d.ohlcPending || minutes >= INDEX_CONFIRM_UNTIL;
   if (task === 'institutional') return d.stage === 'with_block';
   // 已存的資料若是整列 0（舊版沒有防呆時存進去的），不算抓齊，要重抓
   if (task === 'futures') return !(d.long === 0 && d.short === 0);
