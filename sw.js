@@ -1,4 +1,4 @@
-// 台股盤中即時看板 Service Worker
+// 台股資訊 Service Worker
 // 策略：
 //   1. WebSocket、SSE (/api/stream)、所有 /api/ 端點、報價請求與 data.json 一律走 Network-Only（絕不快取）
 //   2. 靜態網頁外殼（HTML / CSS / JS / Manifest / 圖示）採嚴格 Network-First，搭配 skipWaiting + clients.claim 確保每次推版即時生效

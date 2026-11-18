@@ -1480,8 +1480,8 @@ test('外資台股期貨空單：多日 CSV 前一交易日解析與渲染（增
 test('PWA 完整設定：Manifest、PNG 圖示尺寸、Safe Area、與 Service Worker（靜態 Network-First / 行情 Network-Only）', async () => {
   // 1) Web App Manifest 規格驗證
   const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
-  assert.equal(manifest.name, '台股盤中即時看板');
-  assert.equal(manifest.short_name, '台股即時');
+  assert.equal(manifest.name, '台股資訊');
+  assert.equal(manifest.short_name, '台股資訊');
   assert.equal(manifest.display, 'standalone');
   assert.equal(manifest.start_url, './');
   assert.equal(manifest.scope, './');
@@ -1512,6 +1512,7 @@ test('PWA 完整設定：Manifest、PNG 圖示尺寸、Safe Area、與 Service W
   assert.ok(html.includes('name="theme-color" content="#0b1220"'));
   assert.ok(html.includes('name="apple-mobile-web-app-capable" content="yes"'));
   assert.ok(html.includes('name="apple-mobile-web-app-status-bar-style" content="black-translucent"'));
+  assert.ok(html.includes('name="apple-mobile-web-app-title" content="台股資訊"'));
   assert.ok(html.includes('rel="manifest" href="manifest.json"'));
   assert.ok(html.includes('rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png"'));
 
