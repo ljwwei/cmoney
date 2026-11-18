@@ -954,28 +954,34 @@ const WEATHER_AQI_CACHE_KEY = 'https://cache.cmoney.local/api/weather-aqi-v1';
 /**
  * 判斷此刻是否需要向環境部抓取 AQI（台北時間）：
  *  - 若已有「本小時」新資料（storedHour >= currentHour），立即停止抓取直到下個小時的 05 分
- *  - 否則僅於每小時 05～20 分之間每 1 分鐘嘗試抓取一次（冷啟動缺資料或落後逾 2 小時除外）
+ *  - 否則：
+ *    - 05～20 分（主要發布窗口）或資料已落後逾 2 小時／冷啟動：每 1 分鐘（55 秒冷卻）抓取一次
+ *    - 21～59 分（若環境部延遲發布或冷卻跨過 :20 仍未取得本小時新資料）：隨氣溫每 3 分鐘（175 秒冷卻）保底重試至抓到為止
  */
 export function shouldFetchAqi(cachedEntry, nowMs = Date.now()) {
-  const attemptedRecently = Boolean(
-    cachedEntry?.lastAttemptMs && nowMs - cachedEntry.lastAttemptMs < AQI_HUNT_INTERVAL_MS,
-  );
-  if (attemptedRecently) return false;
-
-  const aqiData = cachedEntry?.data;
-  if (!aqiData?.aqiPublishTime) return true; // 尚無任何 AQI 資料（冷啟動）先抓一次
-
   const { date, time } = taipeiNowParts(new Date(nowMs));
   const currentHour = `${date.replace(/-/g, '/')} ${time.slice(0, 2)}`;
   const minute = Number(time.slice(3, 5));
-  const storedHour = String(aqiData.aqiPublishTime).slice(0, 13);
+  const aqiData = cachedEntry?.data;
+  const pubTime = String(aqiData?.aqiPublishTime || '');
+  const storedHour = pubTime.slice(0, 13);
 
-  if (storedHour >= currentHour) return false; // 已抓到本小時最新 AQI，不再抓
+  if (storedHour && storedHour >= currentHour) return false; // 已抓到本小時最新 AQI，不再抓
 
-  const pubMs = Date.parse(`${String(aqiData.aqiPublishTime).replace(/\//g, '-').replace(' ', 'T')}+08:00`);
-  if (!Number.isFinite(pubMs) || nowMs - pubMs > AQI_STALE_MS) return true;
+  const lastAttempt = cachedEntry?.lastAttemptMs ?? 0;
+  const inHuntWindow = minute >= AQI_HUNT_START_MIN && minute <= AQI_HUNT_END_MIN;
+  const pubMs = pubTime ? Date.parse(`${pubTime.replace(/\//g, '-').replace(' ', 'T')}+08:00`) : NaN;
+  const isColdOrVeryStale = !pubTime || !Number.isFinite(pubMs) || nowMs - pubMs > AQI_STALE_MS;
 
-  return minute >= AQI_HUNT_START_MIN && minute <= AQI_HUNT_END_MIN;
+  if (isColdOrVeryStale || inHuntWindow) {
+    return !lastAttempt || nowMs - lastAttempt >= AQI_HUNT_INTERVAL_MS;
+  }
+
+  if (minute > AQI_HUNT_END_MIN) {
+    return !lastAttempt || nowMs - lastAttempt >= WEATHER_TEMP_TTL_MS;
+  }
+
+  return false; // 00～04 分且僅落後 1 小時：靜待 05 分啟動下一輪
 }
 
 export function computeAqiStatus(aqi) {
@@ -1081,16 +1087,26 @@ export async function fetchWeatherReport(
   if (!cwaKey) missingKeys.push('CWA_API_KEY');
   if (!moenvKey) missingKeys.push('MOENV_API_KEY');
 
+  const { date: nowDate, time: nowTime } = taipeiNowParts(new Date(nowMs));
+  const currentHourKey = `${nowDate.replace(/-/g, '/')} ${nowTime.slice(0, 2)}`;
+
   let tempEntry = state?.tempEntry && state.tempEntry.requestedStation === stationId ? state.tempEntry : null;
-  if (!tempEntry && cacheStore) {
+  if ((!tempEntry || nowMs - tempEntry.fetchedAtMs >= WEATHER_TEMP_TTL_MS) && cacheStore) {
     const edgeTemp = await readEdgeJson(cacheStore, WEATHER_TEMP_CACHE_KEY);
-    if (edgeTemp?.requestedStation === stationId) tempEntry = edgeTemp;
+    if (edgeTemp?.requestedStation === stationId && (!tempEntry || (edgeTemp.fetchedAtMs ?? 0) > (tempEntry.fetchedAtMs ?? 0))) {
+      tempEntry = edgeTemp;
+      if (state) state.tempEntry = tempEntry;
+    }
   }
 
   let aqiEntry = state?.aqiEntry && aqiEntryMatch(state.aqiEntry, siteName) ? state.aqiEntry : null;
-  if (!aqiEntry && cacheStore) {
+  const memHasCurHour = Boolean(aqiEntry?.data?.aqiPublishTime && String(aqiEntry.data.aqiPublishTime).slice(0, 13) >= currentHourKey);
+  if (!memHasCurHour && cacheStore) {
     const edgeAqi = await readEdgeJson(cacheStore, WEATHER_AQI_CACHE_KEY);
-    if (aqiEntryMatch(edgeAqi, siteName)) aqiEntry = edgeAqi;
+    if (aqiEntryMatch(edgeAqi, siteName) && (!aqiEntry || (edgeAqi.lastAttemptMs ?? 0) > (aqiEntry.lastAttemptMs ?? 0))) {
+      aqiEntry = edgeAqi;
+      if (state) state.aqiEntry = aqiEntry;
+    }
   }
 
   const needTempFetch = Boolean(cwaKey && (!tempEntry?.data || nowMs - tempEntry.fetchedAtMs >= WEATHER_TEMP_TTL_MS));
@@ -1118,7 +1134,7 @@ export async function fetchWeatherReport(
     if (!needAqiFetch) return { skipped: true, data: null };
     try {
       const url = `${MOENV_AQI_URL}?api_key=${encodeURIComponent(moenvKey)}&limit=10&format=json&filters=${encodeURIComponent(`sitename,EQ,${siteName}`)}`;
-      const json = await fetchJsonWithTimeout(fetchImpl, url, 5000);
+      const json = await fetchJsonWithTimeout(fetchImpl, url, 8000);
       return { skipped: false, data: parseMoenvAqi(json, siteName) };
     } catch {
       return { skipped: false, data: null };

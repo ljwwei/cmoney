@@ -1107,7 +1107,7 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
   );
   assert.equal(moenvCalls, 4);
 
-  // 5. 純函式 shouldFetchAqi 邊界驗證
+  // 5. 純函式 shouldFetchAqi 邊界與逾時保底驗證
   assert.equal(
     shouldFetchAqi(
       { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T16:12:00').getTime() },
@@ -1115,10 +1115,25 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
     ),
     false,
   );
+  // 若已過 :20 仍未取得本小時新資料：前次嘗試未滿 3 分鐘冷卻仍為 false，滿 3 分鐘後隨氣溫補抓，抓到本小時資料後即刻停止
   assert.equal(
     shouldFetchAqi(
-      { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T16:12:00').getTime() },
+      { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T17:20:30').getTime() },
       tpe('2026-11-18T17:21:00').getTime(),
+    ),
+    false,
+  );
+  assert.equal(
+    shouldFetchAqi(
+      { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T17:20:30').getTime() },
+      tpe('2026-11-18T17:23:30').getTime(),
+    ),
+    true,
+  );
+  assert.equal(
+    shouldFetchAqi(
+      { data: { aqiPublishTime: '2026/11/18 17:00:00' }, lastAttemptMs: tpe('2026-11-18T17:23:30').getTime() },
+      tpe('2026-11-18T17:30:00').getTime(),
     ),
     false,
   );
