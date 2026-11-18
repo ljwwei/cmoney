@@ -24,6 +24,7 @@ import {
   acceptLiveQuote,
   selectIndexDisplay,
   renderIndex,
+  renderFut,
   indexBadge,
   createLiveStreamController,
   initVisitCounter,
@@ -1299,4 +1300,50 @@ test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑
   assert.ok(css.includes('background-attachment: fixed;'));
   assert.ok(css.includes('@media (max-width: 959.98px)'));
   assert.ok(css.includes('@media (max-width: 599.98px)'));
+});
+
+test('外資台股期貨空單：多日 CSV 前一交易日解析與渲染（增空綠、減空紅、持平、降級與多空反轉）', () => {
+  const head = '日期,商品名稱,身份別,a,b,c,d,e,f,g,h,i,j,k,l';
+  const day16 = '2026/11/16,臺股期貨,外資及陸資,162613,1,157435,1,5178,1,12030,1,108817,1,-96787,1';
+  const day17 = '2026/11/17,臺股期貨,外資及陸資,153931,1,155075,1,-1144,1,17052,1,114948,1,-97896,1';
+  const day18 = '2026/11/18,臺股期貨,外資及陸資,93106,1,95726,1,-2620,1,9922,1,109360,1,-99438,1';
+  const parsed = parseFuturesCsv([head, day16, day17, day18].join('\r\n'), '2026-11-18');
+  assert.deepEqual(parsed, {
+    foreignNet: -99438,
+    long: 9922,
+    short: 109360,
+    prevForeignNet: -97896,
+  });
+
+  // 空單增加：偏空綠色 down
+  const incHtml = renderFut({ foreignNet: -99438, prevForeignNet: -97896 });
+  assert.match(incHtml, /class="fut__num down">99,438<small>口<\/small>/);
+  assert.match(incHtml, /<span class="chip down">較前一交易日增加 1,542 口<\/span>/);
+  assert.match(incHtml, /前一交易日 97,896 口空單/);
+
+  // 空單減少：偏多紅色 up
+  const decHtml = renderFut({ foreignNet: -95000, prevForeignNet: -99438 });
+  assert.match(decHtml, /class="fut__num down">95,000<small>口<\/small>/);
+  assert.match(decHtml, /<span class="chip up">較前一交易日減少 4,438 口<\/span>/);
+  assert.match(decHtml, /前一交易日 99,438 口空單/);
+
+  // 持平：flat
+  const flatHtml = renderFut({ foreignNet: -99438, prevForeignNet: -99438 });
+  assert.match(flatHtml, /<span class="chip flat">較前一交易日持平<\/span>/);
+
+  // 無前一交易日資料：降級顯示淨空單且不出現 NaN
+  const legacyHtml = renderFut({ foreignNet: -99438 });
+  assert.match(legacyHtml, /<span class="chip down">淨空單<\/span>/);
+  assert.equal(/NaN|undefined/.test(legacyHtml), false);
+
+  // 由空轉多：up（偏多紅色）
+  const flipUpHtml = renderFut({ foreignNet: 1000, prevForeignNet: -2000 });
+  assert.match(flipUpHtml, /class="fut__num up">1,000<small>口<\/small>/);
+  assert.match(flipUpHtml, /<span class="chip up">淨多單（由空轉多 3,000 口）<\/span>/);
+  assert.match(flipUpHtml, /前一交易日 2,000 口空單/);
+
+  // 首頁標題與 meta 描述已更新
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.ok(html.includes('<h2 id="t-fut">外資台股期貨空單</h2>'));
+  assert.ok(!html.includes('外資台股期貨未平倉'));
 });

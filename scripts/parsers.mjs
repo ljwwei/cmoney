@@ -154,29 +154,49 @@ export function parseMargin(json) {
   return null;
 }
 
+function parseFuturesRow(line) {
+  const c = line.split(',').map((s) => s.trim());
+  if (c.length < 14) return null;
+  if (c[1] !== '臺股期貨' || !c[2].startsWith('外資')) return null;
+  const net = num(c[13]);
+  if (!Number.isFinite(net)) return null;
+  // 防呆：期交所剛開始提供資料時，欄位可能整列都是 0。外資未平倉多空方不可能同時為 0，
+  // 整列全 0 一律視為「尚未提供正式資料」，繼續等
+  const nums = c.slice(3, 15).map(num);
+  if (nums.some((n) => !Number.isFinite(n))) return null;
+  if (nums.every((n) => n === 0)) return null;
+  const long = num(c[9]);
+  const short = num(c[11]);
+  if (long === 0 && short === 0) return null;
+  return { rowDate: c[0], foreignNet: net, long, short };
+}
+
 /**
  * 期交所「三大法人-區分各期貨契約」CSV（臺股期貨）。
- * 回傳指定日期、外資及陸資的未平倉多空淨額口數。
+ * 回傳指定日期、外資及陸資的未平倉多空淨額口數；若 CSV 含較早交易日資料，亦帶回最近一筆前一交易日淨額 (prevForeignNet)。
  * @param {string} csv 已解碼的 CSV 文字
  * @param {string} date YYYY-MM-DD
  */
 export function parseFuturesCsv(csv, date) {
   const want = date.replace(/-/g, '/');
+  let target = null;
+  let prev = null;
   for (const line of String(csv).split(/\r?\n/)) {
-    const c = line.split(',').map((s) => s.trim());
-    if (c.length < 14) continue;
-    if (c[0] !== want || c[1] !== '臺股期貨' || !c[2].startsWith('外資')) continue;
-    const net = num(c[13]);
-    if (!Number.isFinite(net)) return null;
-    // 防呆：期交所剛開始提供資料時，欄位可能整列都是 0。外資未平倉多空方不可能同時為 0，
-    // 整列全 0 一律視為「尚未提供正式資料」，繼續等
-    const nums = c.slice(3, 15).map(num);
-    if (nums.some((n) => !Number.isFinite(n))) return null;
-    if (nums.every((n) => n === 0)) return null;
-    if (num(c[9]) === 0 && num(c[11]) === 0) return null;
-    return { foreignNet: net, long: num(c[9]), short: num(c[11]) };
+    const row = parseFuturesRow(line);
+    if (!row) continue;
+    if (row.rowDate === want) {
+      target = row;
+    } else if (/^\d{4}\/\d{2}\/\d{2}$/.test(row.rowDate) && row.rowDate < want) {
+      if (!prev || row.rowDate > prev.rowDate) prev = row;
+    }
   }
-  return null;
+  if (!target) return null;
+  return {
+    foreignNet: target.foreignNet,
+    long: target.long,
+    short: target.short,
+    ...(prev ? { prevForeignNet: prev.foreignNet } : {}),
+  };
 }
 
 /** 證交所休市日（openapi holidaySchedule）。民國日期 1150101 → 2026-01-01 */

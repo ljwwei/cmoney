@@ -180,11 +180,18 @@ async function fetchMargin(date) {
   return v ? { status: 'ok', value: v } : { status: 'nodata' };
 }
 
+function shiftDate(dateStr, deltaDays) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + deltaDays);
+  return d.toISOString().slice(0, 10);
+}
+
 async function fetchFutures(date) {
-  const slash = date.replace(/-/g, '/');
+  const endSlash = date.replace(/-/g, '/');
+  const startSlash = shiftDate(date, -20).replace(/-/g, '/');
   const body = new URLSearchParams({
-    queryStartDate: slash,
-    queryEndDate: slash,
+    queryStartDate: startSlash,
+    queryEndDate: endSlash,
     commodityId: 'TXF',
   });
   const buf = await httpGet('https://www.taifex.com.tw/cht/3/futContractsDateDown', {
@@ -277,6 +284,14 @@ async function main() {
   ) {
     due.push('index');
   }
+  if (
+    backfill &&
+    !due.includes('futures') &&
+    state.futures?.date === today &&
+    state.futures.prevForeignNet == null
+  ) {
+    due.push('futures');
+  }
   console.log(`${today} ${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')} 待抓取：${due.join(', ') || '（無）'}`);
 
   // 1) 加權指數（同時負責偵測臨時休市）
@@ -328,11 +343,26 @@ async function main() {
     }
   }
 
-  // 2) 外資期貨未平倉
+  // 2) 外資台股期貨空單（含前一交易日淨額）
   if (due.includes('futures')) {
     try {
       const r = await fetchFutures(today);
-      if (r.status === 'ok') changed = apply(state, 'futures', today, r.value, nowIso) || changed;
+      if (r.status === 'ok') {
+        const prevFut = state.futures;
+        const fallbackPrevNet =
+          prevFut && prevFut.date < today && Number.isFinite(prevFut.foreignNet)
+            ? prevFut.foreignNet
+            : prevFut?.date === today && Number.isFinite(prevFut.prevForeignNet)
+              ? prevFut.prevForeignNet
+              : null;
+        const payload = {
+          ...r.value,
+          ...(r.value.prevForeignNet == null && fallbackPrevNet != null
+            ? { prevForeignNet: fallbackPrevNet }
+            : {}),
+        };
+        changed = apply(state, 'futures', today, payload, nowIso) || changed;
+      }
     } catch (e) {
       console.warn(`外資期貨未平倉抓取失敗：${e.message}`);
     }

@@ -478,18 +478,43 @@ function instBadge(d) {
     : '<span class="badge badge--noblock">不含鉅額</span>';
 }
 
-function renderFut(d) {
+export function renderFut(d) {
   const net = d.foreignNet;
-  const cls = net < 0 ? 'down' : net > 0 ? 'up' : 'flat';
-  const side = net < 0 ? '淨空單' : net > 0 ? '淨多單' : '多空持平';
+  const netCls = net < 0 ? 'down' : net > 0 ? 'up' : 'flat';
+  const prevNet = d.prevForeignNet;
+  const hasPrev = Number.isFinite(prevNet);
+
+  let chipCls = netCls;
+  let chipText = net < 0 ? '淨空單' : net > 0 ? '淨多單' : '多空持平';
+  let prevText = '';
+
+  if (hasPrev) {
+    const netDiff = net - prevNet; // 正代表偏多（減空／增淨多），負代表偏空（增空／減淨多）
+    chipCls = dirClass(netDiff);
+    if (net <= 0 && prevNet <= 0) {
+      const shortDelta = Math.abs(net) - Math.abs(prevNet);
+      const word = shortDelta > 0 ? '增加' : shortDelta < 0 ? '減少' : '持平';
+      chipText = `較前一交易日${word}${shortDelta === 0 ? '' : ` ${fmt(Math.abs(shortDelta))} 口`}`;
+      prevText = `<br>前一交易日 ${fmt(Math.abs(prevNet))} 口空單`;
+    } else if (net >= 0 && prevNet >= 0) {
+      const word = netDiff > 0 ? '增加' : netDiff < 0 ? '減少' : '持平';
+      chipText = `淨多單 較前一交易日${word}${netDiff === 0 ? '' : ` ${fmt(Math.abs(netDiff))} 口`}`;
+      prevText = prevNet === 0 ? '<br>前一交易日多空持平' : `<br>前一交易日 ${fmt(prevNet)} 口淨多單`;
+    } else if (prevNet < 0 && net > 0) {
+      chipText = `淨多單（由空轉多 ${fmt(netDiff)} 口）`;
+      prevText = `<br>前一交易日 ${fmt(Math.abs(prevNet))} 口空單`;
+    } else {
+      chipText = `由多轉空 ${fmt(Math.abs(netDiff))} 口`;
+      prevText = `<br>前一交易日 ${fmt(prevNet)} 口淨多單`;
+    }
+  }
+
   return `
-    <div class="fut ${cls}">
-      <div class="fut__num">${fmt(Math.abs(net))}<small>口</small></div>
-      <span class="chip ${cls}">${side}</span>
+    <div class="fut">
+      <div class="fut__num ${netCls}">${fmt(Math.abs(net))}<small>口</small></div>
+      <span class="chip ${chipCls}">${chipText}</span>
     </div>
-    <p class="sub">外資及陸資・臺股期貨・未平倉多空淨額${
-      d.long != null && d.short != null ? `<br>多方 ${fmt(d.long)} 口 ／ 空方 ${fmt(d.short)} 口` : ''
-    }</p>`;
+    <p class="sub">外資及陸資・臺股期貨・未平倉多空淨額${prevText}</p>`;
 }
 
 function renderMargin(d) {
