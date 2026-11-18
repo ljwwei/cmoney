@@ -56,11 +56,11 @@ body {
   line-height: 1.5;
 }
 
-/* ====== OLED 防烙印微幅像素位移（常駐背景運作，不影響外層滿版背景與 Sticky 頂欄） ====== */
+/* ====== OLED 防烙印微幅像素位移（常駐背景運作，採整數實體像素對齊，避免桌面端 GPU 圖層與半像素造成模糊） ====== */
 .pixel-shift {
-  will-change: transform;
-  transition: transform 2.5s ease-in-out;
-  transform: translate(0px, 0px);
+  position: relative;
+  left: 0px;
+  top: 0px;
 }
 .pixel-shift-main {
   display: block;

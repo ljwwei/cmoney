@@ -821,9 +821,14 @@ export function initLiveWeather({
 
 /* ========================================================
    常駐型 OLED 防烙印微幅像素位移 (Always-On Pixel Shift)
-   每 60 秒依 8 點路徑循環位移 ±3px，卸載時 clearInterval 釋放
+   - 每 60 秒依 8 點路徑循環位移
+   - 針對 devicePixelRatio 吸附至整數實體像素（解決 Windows 125%/150% 縮放半像素模糊）
+   - 電腦版移動中與靜止期皆採無 GPU transform 的整數實體像素定位，完整保留 ClearType 銳利度
+   - 手機觸控裝置僅於 2.5 秒緩移期間啟用 GPU transform，結束後即釋放圖層回歸清晰定位
    ======================================================== */
 export const PIXEL_SHIFT_INTERVAL_MS = 60 * 1000;
+export const PIXEL_SHIFT_TRANSITION_MS = 2500;
+export const PIXEL_SHIFT_STEP_MS = 450;
 export const PIXEL_SHIFT_PATH = [
   [0, 0],
   [3, 0],
@@ -835,43 +840,227 @@ export const PIXEL_SHIFT_PATH = [
   [0, -3],
 ];
 
+/** 將目標 CSS 位移吸附至最接近的整數實體像素（避免 1.25x / 1.5x / 2.625x 等縮放半像素模糊） */
+export function snapCssOffset(cssPx, dpr = 1) {
+  if (!cssPx) return 0;
+  if (!Number.isFinite(dpr) || dpr <= 0) return cssPx;
+  const sign = Math.sign(cssPx);
+  const abs = Math.abs(cssPx);
+  for (const candidate of [abs, abs + 1, Math.max(1, abs - 1)]) {
+    const phys = candidate * dpr;
+    if (Math.abs(phys - Math.round(phys)) < 0.01) {
+      return sign * candidate;
+    }
+  }
+  return Math.round(cssPx * dpr) / dpr;
+}
+
+/** 產生只包含整數實體像素的中繼微步，讓電腦版「移動中」每一格也保持絕對銳利 */
+export function buildCrispShiftSteps(from, to, dpr = 1) {
+  const [fromX, fromY] = from;
+  const [toX, toY] = to;
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  if (dx === 0 && dy === 0) return [];
+  if (dx !== 0 && dy !== 0) return [[toX, toY]];
+
+  const total = Math.abs(dx || dy);
+  const sign = Math.sign(dx || dy);
+  const validDpr = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+
+  let stepSize = total;
+  for (let cand = 1; cand <= total; cand += 1) {
+    const phys = cand * validDpr;
+    if (total % cand === 0 && Math.abs(phys - Math.round(phys)) < 0.01) {
+      stepSize = cand;
+      break;
+    }
+  }
+
+  const steps = [];
+  for (let walked = stepSize; walked <= total; walked += stepSize) {
+    steps.push(
+      dx !== 0 ? [fromX + sign * walked, toY] : [toX, fromY + sign * walked],
+    );
+  }
+  if (!steps.length || steps[steps.length - 1][0] !== toX || steps[steps.length - 1][1] !== toY) {
+    steps.push([toX, toY]);
+  }
+  return steps;
+}
+
 export function initPixelShift({
   documentRef = typeof document !== 'undefined' ? document : null,
+  windowRef = typeof window !== 'undefined' ? window : null,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+  rafFn = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeoutFn(fn, 0),
+  cancelRafFn = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeoutFn,
   intervalMs = PIXEL_SHIFT_INTERVAL_MS,
+  stepMs = PIXEL_SHIFT_STEP_MS,
+  transitionMs = PIXEL_SHIFT_TRANSITION_MS,
 } = {}) {
   const targets = [...(documentRef?.querySelectorAll?.('.pixel-shift') ?? [])];
   if (!targets.length) return null;
 
   let stepIndex = 0;
+  let currentCoord = [0, 0];
+  let stopped = false;
+  let settleTimerId = null;
+  let subStepTimerId = null;
+  let rafId = null;
 
-  function applyStep(idx) {
-    const [x, y] = PIXEL_SHIFT_PATH[idx];
-    const transform = `translate(${x}px, ${y}px)`;
-    targets.forEach((el) => {
-      el.style.transform = transform;
-    });
+  const getDpr = () => {
+    const dpr = Number(windowRef?.devicePixelRatio);
+    return Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  };
+  const isTouchMobile = () => Boolean(windowRef?.matchMedia?.('(pointer: coarse) and (hover: none)')?.matches);
+  const isHidden = () => Boolean(documentRef?.hidden);
+
+  function cancelPendingMotion() {
+    if (subStepTimerId != null) {
+      clearTimeoutFn(subStepTimerId);
+      subStepTimerId = null;
+    }
+    if (settleTimerId != null) {
+      clearTimeoutFn(settleTimerId);
+      settleTimerId = null;
+    }
+    if (rafId != null) {
+      cancelRafFn(rafId);
+      rafId = null;
+    }
   }
 
-  applyStep(0);
-  let timerId = setIntervalFn(() => {
+  function applyStaticCoord(x, y) {
+    targets.forEach((el) => {
+      el.style.transition = 'none';
+      el.style.transform = 'none';
+      el.style.willChange = 'auto';
+      el.style.left = `${x}px`;
+      el.style.top = `${y}px`;
+    });
+    currentCoord = [x, y];
+  }
+
+  function snapTargetForIndex(idx) {
+    const [rawX, rawY] = PIXEL_SHIFT_PATH[idx];
+    const dpr = getDpr();
+    return [snapCssOffset(rawX, dpr), snapCssOffset(rawY, dpr)];
+  }
+
+  function transitionToIndex(idx) {
+    cancelPendingMotion();
+    const [fromX, fromY] = currentCoord;
+    const [toX, toY] = snapTargetForIndex(idx);
+    if (fromX === toX && fromY === toY) {
+      applyStaticCoord(toX, toY);
+      return;
+    }
+
+    if (isHidden()) {
+      applyStaticCoord(toX, toY);
+      return;
+    }
+
+    // 手機觸控裝置（高 PPI 無 ClearType 問題）：僅於移動中啟動 2.5s GPU 平滑位移，完成後釋放回清晰靜態定位
+    if (isTouchMobile() && transitionMs > 0) {
+      const invX = fromX - toX;
+      const invY = fromY - toY;
+      targets.forEach((el) => {
+        el.style.willChange = 'transform';
+        el.style.transition = 'none';
+        el.style.left = `${toX}px`;
+        el.style.top = `${toY}px`;
+        el.style.transform = `translate(${invX}px, ${invY}px)`;
+        el.getBoundingClientRect?.();
+      });
+      currentCoord = [toX, toY];
+      rafId = rafFn(() => {
+        rafId = null;
+        if (stopped) return;
+        targets.forEach((el) => {
+          el.style.transition = `transform ${transitionMs}ms ease-in-out`;
+          el.style.transform = 'translate(0px, 0px)';
+        });
+        settleTimerId = setTimeoutFn(() => {
+          settleTimerId = null;
+          if (!stopped) applyStaticCoord(toX, toY);
+        }, transitionMs + 80);
+      });
+      return;
+    }
+
+    // 電腦版：採純整數實體像素逐格微步（不使用 GPU transform 與插值模糊），移動中與完成後皆維持 100% 銳利
+    const subSteps = buildCrispShiftSteps([fromX, fromY], [toX, toY], getDpr());
+    if (!subSteps.length) {
+      applyStaticCoord(toX, toY);
+      return;
+    }
+
+    let cursor = 0;
+    const runSubStep = () => {
+      subStepTimerId = null;
+      if (stopped) return;
+      const [nx, ny] = subSteps[cursor];
+      applyStaticCoord(nx, ny);
+      cursor += 1;
+      if (cursor < subSteps.length) {
+        subStepTimerId = setTimeoutFn(runSubStep, stepMs);
+      }
+    };
+    runSubStep();
+  }
+
+  function advance() {
     stepIndex = (stepIndex + 1) % PIXEL_SHIFT_PATH.length;
-    applyStep(stepIndex);
-  }, intervalMs);
+    transitionToIndex(stepIndex);
+  }
+
+  function realign() {
+    if (stopped) return;
+    const [tx, ty] = snapTargetForIndex(stepIndex);
+    if (
+      !isHidden() &&
+      settleTimerId == null &&
+      subStepTimerId == null &&
+      rafId == null &&
+      tx === currentCoord[0] &&
+      ty === currentCoord[1]
+    ) {
+      return;
+    }
+    cancelPendingMotion();
+    applyStaticCoord(tx, ty);
+  }
+
+  const [initX, initY] = snapTargetForIndex(0);
+  applyStaticCoord(initX, initY);
+  let timerId = setIntervalFn(advance, intervalMs);
+
+  const onVisibility = () => {
+    if (isHidden()) realign();
+  };
+  windowRef?.addEventListener?.('resize', realign);
+  documentRef?.addEventListener?.('visibilitychange', onVisibility);
 
   return {
-    step() {
-      stepIndex = (stepIndex + 1) % PIXEL_SHIFT_PATH.length;
-      applyStep(stepIndex);
-    },
+    step: advance,
+    realign,
     stop() {
+      stopped = true;
+      cancelPendingMotion();
       if (timerId != null) {
         clearIntervalFn(timerId);
         timerId = null;
       }
+      windowRef?.removeEventListener?.('resize', realign);
+      documentRef?.removeEventListener?.('visibilitychange', onVisibility);
     },
     getStepIndex: () => stepIndex,
+    getCurrentCoord: () => [...currentCoord],
   };
 }
 

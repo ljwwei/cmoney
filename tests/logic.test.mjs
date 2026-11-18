@@ -35,6 +35,8 @@ import {
   initLiveWeather,
   PIXEL_SHIFT_INTERVAL_MS,
   PIXEL_SHIFT_PATH,
+  snapCssOffset,
+  buildCrispShiftSteps,
   initPixelShift,
   FALLBACK_POLL_MS,
 } from '../js/app.js';
@@ -1230,7 +1232,7 @@ test('前端頂部氣象/空品元件（formatWeatherTime、動態 05–20 分 1
   assert.equal(scheduled.size, 0);
 });
 
-test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑循環位移且卸載時 clearInterval', () => {
+test('OLED 防烙印微幅位移（initPixelShift）：整數實體像素吸附、電腦版無糊清晰微步、手機版平滑後釋放與卸載清除', () => {
   assert.equal(PIXEL_SHIFT_INTERVAL_MS, 60000);
   assert.deepEqual(PIXEL_SHIFT_PATH, [
     [0, 0],
@@ -1243,60 +1245,170 @@ test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑
     [0, -3],
   ]);
 
-  const topbarInner = { style: { transform: '' } };
-  const mainContainer = { style: { transform: '' } };
+  // 1) 不同螢幕縮放（100% / 125% / 150% / 175% / 200% / 262.5%）皆吸附至整數實體像素
+  assert.equal(snapCssOffset(3, 1), 3);
+  assert.equal(snapCssOffset(3, 1.25), 4);
+  assert.equal(snapCssOffset(-3, 1.25), -4);
+  assert.equal(snapCssOffset(3, 1.5), 4);
+  assert.equal(snapCssOffset(3, 1.75), 4);
+  assert.equal(snapCssOffset(3, 2), 3);
+  assert.equal(snapCssOffset(0, 1.25), 0);
+  assert.ok(Math.abs(snapCssOffset(3, 2.625) * 2.625 - 8) < 1e-9);
+
+  // 2) 電腦版微步產生器：只產出整數實體像素座標
+  assert.deepEqual(buildCrispShiftSteps([0, 0], [3, 0], 1), [
+    [1, 0],
+    [2, 0],
+    [3, 0],
+  ]);
+  assert.deepEqual(buildCrispShiftSteps([0, 0], [4, 0], 1.5), [
+    [2, 0],
+    [4, 0],
+  ]);
+  assert.deepEqual(buildCrispShiftSteps([0, 0], [4, 0], 1.25), [[4, 0]]);
+
+  // 3) 電腦版流程（無常駐 GPU transform，不損毀 ClearType 與縮放清晰度）
+  const topbarInner = { style: {} };
+  const mainContainer = { style: {} };
   let registeredFn = null;
   let registeredMs = null;
   const clearedIds = [];
+  const timeouts = new Map();
+  let nextTimeoutId = 1;
+  const listeners = new Map();
+  let dpr = 1.25;
 
   const ctl = initPixelShift({
     documentRef: {
+      hidden: false,
       querySelectorAll: (sel) => (sel === '.pixel-shift' ? [topbarInner, mainContainer] : []),
+      addEventListener: (ev, fn) => listeners.set(`doc:${ev}`, fn),
+      removeEventListener: (ev) => listeners.delete(`doc:${ev}`),
+    },
+    windowRef: {
+      get devicePixelRatio() {
+        return dpr;
+      },
+      matchMedia: () => ({ matches: false }),
+      addEventListener: (ev, fn) => listeners.set(`win:${ev}`, fn),
+      removeEventListener: (ev) => listeners.delete(`win:${ev}`),
     },
     setIntervalFn: (fn, ms) => {
       registeredFn = fn;
       registeredMs = ms;
       return 777;
     },
-    clearIntervalFn: (id) => {
-      clearedIds.push(id);
+    clearIntervalFn: (id) => clearedIds.push(id),
+    setTimeoutFn: (fn) => {
+      const id = nextTimeoutId++;
+      timeouts.set(id, fn);
+      return id;
     },
+    clearTimeoutFn: (id) => timeouts.delete(id),
   });
 
   assert.equal(registeredMs, 60000);
-  assert.equal(topbarInner.style.transform, 'translate(0px, 0px)');
-  assert.equal(mainContainer.style.transform, 'translate(0px, 0px)');
+  assert.equal(topbarInner.style.left, '0px');
+  assert.equal(topbarInner.style.top, '0px');
+  assert.equal(topbarInner.style.transform, 'none');
+  assert.equal(topbarInner.style.willChange, 'auto');
 
-  const expectedTransforms = [
-    'translate(3px, 0px)',
-    'translate(3px, 3px)',
-    'translate(0px, 3px)',
-    'translate(-3px, 3px)',
-    'translate(-3px, 0px)',
-    'translate(-3px, -3px)',
-    'translate(0px, -3px)',
-    'translate(0px, 0px)',
-  ];
-  for (const expected of expectedTransforms) {
-    registeredFn();
-    assert.equal(topbarInner.style.transform, expected);
-    assert.equal(mainContainer.style.transform, expected);
-  }
-  assert.equal(ctl.getStepIndex(), 0);
+  // 1.25x 縮放：跳至 4px (=5 實體像素)，絕不用 transform
+  registeredFn();
+  assert.equal(topbarInner.style.left, '4px');
+  assert.equal(topbarInner.style.top, '0px');
+  assert.equal(topbarInner.style.transform, 'none');
+  assert.equal(topbarInner.style.willChange, 'auto');
+  assert.deepEqual(ctl.getCurrentCoord(), [4, 0]);
+
+  // 切換回 1.0x 並逐步走 1px 微步
+  dpr = 1;
+  listeners.get('win:resize')?.();
+  assert.equal(topbarInner.style.left, '3px');
+
+  const popNext = (map) => {
+    const [k, fn] = map.entries().next().value;
+    map.delete(k);
+    fn();
+  };
+  registeredFn(); // step 2 -> [3, 3]，走 3 步：[3,1] -> [3,2] -> [3,3]
+  assert.deepEqual(ctl.getCurrentCoord(), [3, 1]);
+  assert.equal(topbarInner.style.transform, 'none');
+  popNext(timeouts);
+  assert.deepEqual(ctl.getCurrentCoord(), [3, 2]);
+  popNext(timeouts);
+  assert.deepEqual(ctl.getCurrentCoord(), [3, 3]);
+  assert.equal(timeouts.size, 0);
 
   ctl.stop();
   ctl.stop();
   assert.deepEqual(clearedIds, [777]);
+  assert.equal(listeners.size, 0);
 
-  // 驗證 HTML 與 CSS 符合電腦版／手機版防烙印版面規格，且未加入多餘開關或遮罩
+  // 4) 手機觸控模式：僅在 2.5s 平滑期間啟用 GPU transform，完成後釋放圖層
+  const mTop = { style: {} };
+  const mMain = { style: {} };
+  const mTimeouts = new Map();
+  const mRafs = new Map();
+  let mNextId = 1;
+  let mStepFn = null;
+  const mobileCtl = initPixelShift({
+    documentRef: {
+      hidden: false,
+      querySelectorAll: (sel) => (sel === '.pixel-shift' ? [mTop, mMain] : []),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    },
+    windowRef: {
+      devicePixelRatio: 3,
+      matchMedia: (q) => ({ matches: q.includes('coarse') }),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    },
+    setIntervalFn: (fn) => {
+      mStepFn = fn;
+      return 888;
+    },
+    clearIntervalFn: () => {},
+    setTimeoutFn: (fn) => {
+      const id = mNextId++;
+      mTimeouts.set(id, fn);
+      return id;
+    },
+    clearTimeoutFn: (id) => mTimeouts.delete(id),
+    rafFn: (fn) => {
+      const id = mNextId++;
+      mRafs.set(id, fn);
+      return id;
+    },
+    cancelRafFn: (id) => mRafs.delete(id),
+  });
+
+  assert.equal(mTop.style.willChange, 'auto');
+  assert.equal(mTop.style.transform, 'none');
+  mStepFn(); // [0,0] -> [3,0]
+  assert.equal(mTop.style.willChange, 'transform');
+  assert.equal(mTop.style.left, '3px');
+  assert.equal(mTop.style.transform, 'translate(-3px, 0px)');
+  mRafs.values().next().value();
+  assert.equal(mTop.style.transition, 'transform 2500ms ease-in-out');
+  assert.equal(mTop.style.transform, 'translate(0px, 0px)');
+  mTimeouts.values().next().value(); // 完成移動後釋放 GPU 圖層
+  assert.equal(mTop.style.transform, 'none');
+  assert.equal(mTop.style.willChange, 'auto');
+  assert.equal(mTop.style.left, '3px');
+  mobileCtl.stop();
+
+  // 5) 驗證 HTML 與 CSS 符合電腦版／手機版防烙印版面規格，且未鎖死全域 will-change: transform
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../css/style.css', import.meta.url), 'utf8');
   assert.ok(html.includes('<div class="topbar__inner pixel-shift">'));
   assert.ok(html.includes('<div class="pixel-shift-main pixel-shift">'));
   assert.equal(/pixel[-_ ]?shift[-_ ]?(toggle|btn|switch)|防烙印開關/i.test(html), false);
   assert.ok(css.includes('overflow-x: clip;'));
-  assert.ok(css.includes('will-change: transform;'));
-  assert.ok(css.includes('transition: transform 2.5s ease-in-out;'));
+  assert.equal(css.includes('will-change: transform;'), false);
+  assert.equal(css.includes('transition: transform 2.5s ease-in-out;'), false);
+  assert.ok(css.includes('position: relative;'));
   assert.ok(css.includes('background-attachment: fixed;'));
   assert.ok(css.includes('@media (max-width: 959.98px)'));
   assert.ok(css.includes('@media (max-width: 599.98px)'));
