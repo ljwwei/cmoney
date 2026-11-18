@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { dueTasks, remainingTasks, isTradingDay, taipeiParts, institutionalStage } from '../scripts/schedule.mjs';
 import {
   parseHolidays,
@@ -30,6 +31,9 @@ import {
   aqiStatus,
   aqiLevel,
   initLiveWeather,
+  PIXEL_SHIFT_INTERVAL_MS,
+  PIXEL_SHIFT_PATH,
+  initPixelShift,
   FALLBACK_POLL_MS,
 } from '../js/app.js';
 import {
@@ -1106,4 +1110,76 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   assert.equal(aqiEl.textContent, '空氣品質：普通 AQI 78 (14:00)');
   assert.equal(aqiEl.attrs.get('data-aqi-level'), '1');
   assert.equal(intervalRegistered, 5 * 60 * 1000);
+});
+
+test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑循環位移且卸載時 clearInterval', () => {
+  assert.equal(PIXEL_SHIFT_INTERVAL_MS, 60000);
+  assert.deepEqual(PIXEL_SHIFT_PATH, [
+    [0, 0],
+    [3, 0],
+    [3, 3],
+    [0, 3],
+    [-3, 3],
+    [-3, 0],
+    [-3, -3],
+    [0, -3],
+  ]);
+
+  const topbarInner = { style: { transform: '' } };
+  const mainContainer = { style: { transform: '' } };
+  let registeredFn = null;
+  let registeredMs = null;
+  const clearedIds = [];
+
+  const ctl = initPixelShift({
+    documentRef: {
+      querySelectorAll: (sel) => (sel === '.pixel-shift' ? [topbarInner, mainContainer] : []),
+    },
+    setIntervalFn: (fn, ms) => {
+      registeredFn = fn;
+      registeredMs = ms;
+      return 777;
+    },
+    clearIntervalFn: (id) => {
+      clearedIds.push(id);
+    },
+  });
+
+  assert.equal(registeredMs, 60000);
+  assert.equal(topbarInner.style.transform, 'translate(0px, 0px)');
+  assert.equal(mainContainer.style.transform, 'translate(0px, 0px)');
+
+  const expectedTransforms = [
+    'translate(3px, 0px)',
+    'translate(3px, 3px)',
+    'translate(0px, 3px)',
+    'translate(-3px, 3px)',
+    'translate(-3px, 0px)',
+    'translate(-3px, -3px)',
+    'translate(0px, -3px)',
+    'translate(0px, 0px)',
+  ];
+  for (const expected of expectedTransforms) {
+    registeredFn();
+    assert.equal(topbarInner.style.transform, expected);
+    assert.equal(mainContainer.style.transform, expected);
+  }
+  assert.equal(ctl.getStepIndex(), 0);
+
+  ctl.stop();
+  ctl.stop();
+  assert.deepEqual(clearedIds, [777]);
+
+  // 驗證 HTML 與 CSS 符合電腦版／手機版防烙印版面規格，且未加入多餘開關或遮罩
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('../css/style.css', import.meta.url), 'utf8');
+  assert.ok(html.includes('<div class="topbar__inner pixel-shift">'));
+  assert.ok(html.includes('<div class="pixel-shift-main pixel-shift">'));
+  assert.equal(/pixel[-_ ]?shift[-_ ]?(toggle|btn|switch)|防烙印開關/i.test(html), false);
+  assert.ok(css.includes('overflow-x: clip;'));
+  assert.ok(css.includes('will-change: transform;'));
+  assert.ok(css.includes('transition: transform 2.5s ease-in-out;'));
+  assert.ok(css.includes('background-attachment: fixed;'));
+  assert.ok(css.includes('@media (max-width: 959.98px)'));
+  assert.ok(css.includes('@media (max-width: 599.98px)'));
 });

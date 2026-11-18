@@ -40,16 +40,31 @@
 
 * { box-sizing: border-box; }
 
-html { -webkit-text-size-adjust: 100%; }
+html {
+  -webkit-text-size-adjust: 100%;
+  overflow-x: clip;
+}
 
 body {
   margin: 0;
   min-height: 100vh;
+  overflow-x: clip;
   font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--text);
   background: radial-gradient(1200px 600px at 10% -10%, var(--bg-2), var(--bg));
   background-attachment: fixed;
   line-height: 1.5;
+}
+
+/* ====== OLED 防烙印微幅像素位移（常駐背景運作，不影響外層滿版背景與 Sticky 頂欄） ====== */
+.pixel-shift {
+  will-change: transform;
+  transition: transform 2.5s ease-in-out;
+  transform: translate(0px, 0px);
+}
+.pixel-shift-main {
+  display: block;
+  width: 100%;
 }
 
 .up { color: var(--up); }
@@ -78,16 +93,9 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   gap: 8px 18px;
   flex-wrap: wrap;
 }
-.topbar__left {
-  display: flex;
-  align-items: center;
-  gap: 6px 16px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.brand { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.brand { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; display: flex; align-items: center; gap: 10px; flex-shrink: 0; order: 1; }
 .brand__logo { font-size: 1.4rem; }
-.clock { display: flex; align-items: baseline; gap: 10px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.clock { display: flex; align-items: baseline; gap: 10px; font-variant-numeric: tabular-nums; flex-shrink: 0; order: 3; }
 .clock__label { color: var(--muted); font-size: 0.8rem; }
 .clock__time { font-size: 1.15rem; font-weight: 600; }
 
@@ -100,6 +108,9 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   font-size: 0.84rem;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  margin-right: auto;
+  order: 2;
+  min-width: 0;
 }
 .env-info__icon {
   width: 15px;
@@ -317,10 +328,15 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   .card--index, .card--inst { grid-column: 1 / -1; }
 }
 
+/* ====== 平板／手機頂欄自適應（< 960px：標題與時鐘同列，氣象空品置於第二列） ====== */
+@media (max-width: 959.98px) {
+  .clock { order: 2; }
+  .env-info { order: 3; flex-basis: 100%; margin-right: 0; }
+}
+
 /* ====== 手機版（< 600px）：單欄、緊湊、大字、易點閱 ====== */
 @media (max-width: 599.98px) {
   .topbar__inner { padding: 10px 16px; gap: 6px 12px; }
-  .topbar__left { gap: 4px 10px; }
   .brand { font-size: 1.1rem; }
   .env-info { font-size: 0.78rem; gap: 4px 6px; }
   .weather-badge { font-size: 0.72rem; padding: 1px 8px; }

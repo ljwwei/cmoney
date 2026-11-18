@@ -671,6 +671,7 @@ export function initLiveWeather({
   documentRef = typeof document !== 'undefined' ? document : null,
   nowFn = () => Date.now(),
   setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
   refreshMs = WEATHER_REFRESH_MS,
 } = {}) {
   const tempEls = documentRef?.querySelectorAll?.('[data-live-temp]') ?? [];
@@ -726,14 +727,76 @@ export function initLiveWeather({
   }
 
   const initialPromise = refresh();
-  setIntervalFn(refresh, refreshMs);
+  let intervalId = setIntervalFn(refresh, refreshMs);
 
   return {
     refresh,
     onVisibilityShow() {
       if (nowFn() - lastFetchedAt >= 60 * 1000) refresh();
     },
+    stop() {
+      if (intervalId != null) {
+        clearIntervalFn(intervalId);
+        intervalId = null;
+      }
+    },
     initialPromise,
+  };
+}
+
+/* ========================================================
+   常駐型 OLED 防烙印微幅像素位移 (Always-On Pixel Shift)
+   每 60 秒依 8 點路徑循環位移 ±3px，卸載時 clearInterval 釋放
+   ======================================================== */
+export const PIXEL_SHIFT_INTERVAL_MS = 60 * 1000;
+export const PIXEL_SHIFT_PATH = [
+  [0, 0],
+  [3, 0],
+  [3, 3],
+  [0, 3],
+  [-3, 3],
+  [-3, 0],
+  [-3, -3],
+  [0, -3],
+];
+
+export function initPixelShift({
+  documentRef = typeof document !== 'undefined' ? document : null,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+  intervalMs = PIXEL_SHIFT_INTERVAL_MS,
+} = {}) {
+  const targets = [...(documentRef?.querySelectorAll?.('.pixel-shift') ?? [])];
+  if (!targets.length) return null;
+
+  let stepIndex = 0;
+
+  function applyStep(idx) {
+    const [x, y] = PIXEL_SHIFT_PATH[idx];
+    const transform = `translate(${x}px, ${y}px)`;
+    targets.forEach((el) => {
+      el.style.transform = transform;
+    });
+  }
+
+  applyStep(0);
+  let timerId = setIntervalFn(() => {
+    stepIndex = (stepIndex + 1) % PIXEL_SHIFT_PATH.length;
+    applyStep(stepIndex);
+  }, intervalMs);
+
+  return {
+    step() {
+      stepIndex = (stepIndex + 1) % PIXEL_SHIFT_PATH.length;
+      applyStep(stepIndex);
+    },
+    stop() {
+      if (timerId != null) {
+        clearIntervalFn(timerId);
+        timerId = null;
+      }
+    },
+    getStepIndex: () => stepIndex,
   };
 }
 
@@ -812,6 +875,7 @@ async function load() {
 
 let liveController = null;
 let weatherController = null;
+let pixelShiftController = null;
 
 if (typeof document !== 'undefined') {
   const apiOrigin = resolveApiOrigin();
@@ -823,12 +887,21 @@ if (typeof document !== 'undefined') {
 
   initVisitCounter({ apiOrigin });
   weatherController = initLiveWeather({ apiOrigin });
+  pixelShiftController = initPixelShift();
   load();
-  setInterval(load, 30 * 1000);
-  setInterval(() => {
+  const loadTimer = setInterval(load, 30 * 1000);
+  const clockTimer = setInterval(() => {
     renderAll();
     syncLiveLifecycle();
   }, 1000);
+
+  const cleanup = () => {
+    liveController?.stop();
+    weatherController?.stop();
+    pixelShiftController?.stop();
+    clearInterval(loadTimer);
+    clearInterval(clockTimer);
+  };
 
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
@@ -839,6 +912,6 @@ if (typeof document !== 'undefined') {
       weatherController?.onVisibilityShow();
     }
   });
-  window.addEventListener('pagehide', () => liveController.stop());
-  window.addEventListener('beforeunload', () => liveController.stop());
+  window.addEventListener('pagehide', cleanup);
+  window.addEventListener('beforeunload', cleanup);
 }
