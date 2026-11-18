@@ -869,9 +869,9 @@ test('無 FUGLE_API_KEY 時直接啟用 Yahoo 備援；D1 與 DO SQLite 人數�
 // 4. 臺南市北區氣溫（C0X100）與臺南測站 AQI（Worker 代理 + 前端顯示）
 // ========================================================
 
-test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站 AQI）解析及備援快取', async () => {
+test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南測站 AQI）解析及備援快取', async () => {
   // 1. 同時支援 PascalCase 與 camelCase，並過濾 -99 / X 異常值
-  const pascalTemp = parseCwaTemperature({
+  const stationListPayload = {
     records: {
       Station: [
         {
@@ -888,8 +888,14 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
         },
       ],
     },
+  };
+  assert.deepEqual(parseCwaTemperature(stationListPayload), {
+    station: '臺南',
+    stationId: '467410',
+    temperature: 26.1,
+    tempObsTime: '2026-11-18T14:50:00+08:00',
   });
-  assert.deepEqual(pascalTemp, {
+  assert.deepEqual(parseCwaTemperature(stationListPayload, CWA_NORTH_STATION_ID), {
     station: '臺南市北區',
     stationId: 'C0X100',
     temperature: 26.8,
@@ -949,26 +955,10 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
   const mockFetch = async (url) => {
     upstreamCalls += 1;
     const u = String(url);
-    if (u.includes('O-A0003-001') && u.includes('StationId=C0X100')) {
+    if (u.includes('O-A0003-001')) {
       assert.ok(u.includes('Authorization=cwa-secret'));
+      assert.ok(u.includes('StationId=467410'));
       if (primaryBroken) return new Response(JSON.stringify({ records: { Station: [] } }), { status: 200 });
-      return new Response(
-        JSON.stringify({
-          records: {
-            Station: [
-              {
-                StationId: 'C0X100',
-                StationName: '臺南市北區',
-                ObsTime: { DateTime: '2026-11-18T15:30:00+08:00' },
-                WeatherElement: { AirTemperature: '26.4' },
-              },
-            ],
-          },
-        }),
-        { status: 200 },
-      );
-    }
-    if (u.includes('O-A0003-001') && u.includes('StationId=467410')) {
       return new Response(
         JSON.stringify({
           records: {
@@ -976,8 +966,26 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
               {
                 StationId: '467410',
                 StationName: '臺南',
-                ObsTime: { DateTime: '2026-11-18T15:30:00+08:00' },
-                WeatherElement: { AirTemperature: '26.0' },
+                ObsTime: { DateTime: '2026-11-18T15:40:00+08:00' },
+                WeatherElement: { AirTemperature: '28.2' },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (u.includes('O-A0001-001')) {
+      assert.ok(u.includes('StationId=C0X100'));
+      return new Response(
+        JSON.stringify({
+          records: {
+            Station: [
+              {
+                StationId: 'C0X100',
+                StationName: '臺南市北區',
+                ObsTime: { DateTime: '2026-11-18T15:00:00+08:00' },
+                WeatherElement: { AirTemperature: '28.3' },
               },
             ],
           },
@@ -1013,8 +1021,9 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
   assert.equal(upstreamCalls, 2, 'concurrent hits share one CWA + one MOENV fetch');
   const jA = await rA.json();
   const jB = await rB.json();
-  assert.equal(jA.station, '臺南市北區');
-  assert.equal(jA.temperature, 26.4);
+  assert.equal(jA.station, '臺南');
+  assert.equal(jA.stationId, '467410');
+  assert.equal(jA.temperature, 28.2);
   assert.equal(jA.aqi, 42);
   assert.equal(jA.aqiStatus, '良好');
   assert.equal(jB.aqi, 42);
@@ -1029,7 +1038,7 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
   assert.equal(rLocal.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
   assert.equal(upstreamCalls, 2);
 
-  // 清除快取並模擬 C0X100 缺值 -> 自動退回 467410 臺南氣象站備援
+  // 清除快取並模擬 467410 缺值 -> 自動退回 C0X100 臺南市北區站備援
   cacheMap.clear();
   primaryBroken = true;
   const rFb = await handleWeatherRequest(
@@ -1038,8 +1047,8 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
     { fetchImpl: mockFetch, cacheStore: mockCache, state: { inFlight: null, lastGood: null } },
   );
   const jFb = await rFb.json();
-  assert.equal(jFb.stationId, '467410');
-  assert.equal(jFb.temperature, 26);
+  assert.equal(jFb.stationId, 'C0X100');
+  assert.equal(jFb.temperature, 28.3);
 });
 
 test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM 更新）', async () => {

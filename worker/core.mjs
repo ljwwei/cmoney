@@ -932,14 +932,15 @@ async function defaultCloudflareWsConnect(fetchImpl, url, signal) {
 }
 
 /* ========================================================
-   臺南市北區氣溫（中央氣象署）與臺南測站 AQI（環境部）
+   臺南市氣溫（中央氣象署 467410 臺南站 10 分鐘更新）與臺南測站 AQI（環境部）
    API Key 僅由 Cloudflare Worker Secrets 讀取，不暴露於前端
    ======================================================== */
 export const CWA_OBS_AUTO_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001';
 export const CWA_OBS_SYNOPTIC_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001';
 export const MOENV_AQI_URL = 'https://data.moenv.gov.tw/api/v2/aqx_p_432';
-export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站
-export const CWA_TAINAN_FALLBACK_ID = '467410'; // 臺南氣象站（北區無 10 分鐘回傳時備援）
+export const CWA_TAINAN_STATION_ID = '467410'; // 臺南氣象站（每 10 分鐘一筆）
+export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站（備援）
+export const CWA_TAINAN_FALLBACK_ID = '467410';
 export const MOENV_TAINAN_SITE = '臺南';
 export const WEATHER_CACHE_TTL_SEC = 120; // 2 分鐘邊緣快取，確保即時反映氣象署每 10 分鐘觀測
 const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v2';
@@ -953,7 +954,7 @@ export function computeAqiStatus(aqi) {
   return '危害';
 }
 
-export function parseCwaTemperature(json, preferredId = CWA_NORTH_STATION_ID) {
+export function parseCwaTemperature(json, preferredId = CWA_TAINAN_STATION_ID) {
   const rec = json?.records;
   const list = rec?.Station || rec?.station;
   if (!Array.isArray(list) || !list.length) return null;
@@ -964,7 +965,7 @@ export function parseCwaTemperature(json, preferredId = CWA_NORTH_STATION_ID) {
   if (!Number.isFinite(temp) || temp <= -90 || temp > 65) return null;
   const obs = st?.ObsTime || st?.obsTime;
   const tempObsTime = String(obs?.DateTime ?? obs?.dateTime ?? '').trim();
-  const station = String(st?.StationName ?? st?.stationName ?? '臺南市北區').trim();
+  const station = String(st?.StationName ?? st?.stationName ?? '臺南').trim();
   return {
     station,
     stationId: String(st?.StationId ?? st?.stationId ?? preferredId).trim(),
@@ -1008,7 +1009,7 @@ export async function fetchWeatherReport(
 ) {
   const cwaKey = String(env?.CWA_API_KEY || '').trim();
   const moenvKey = String(env?.MOENV_API_KEY || '').trim();
-  const stationId = String(env?.CWA_STATION_ID || CWA_NORTH_STATION_ID).trim() || CWA_NORTH_STATION_ID;
+  const stationId = String(env?.CWA_STATION_ID || CWA_TAINAN_STATION_ID).trim() || CWA_TAINAN_STATION_ID;
   const siteName = String(env?.MOENV_SITE_NAME || MOENV_TAINAN_SITE).trim() || MOENV_TAINAN_SITE;
 
   const missingKeys = [];
@@ -1017,27 +1018,19 @@ export async function fetchWeatherReport(
 
   const fetchTemp = async () => {
     if (!cwaKey) return null;
-    // 優先使用 O-A0003-001（10 分鐘綜觀氣象資料），比照民德市政府每 10 分鐘更新一次
+    // 直接查詢 O-A0003-001（467410 臺南氣象站，每 10 分鐘一筆）
     const tenMinPrimaryUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
     try {
       const json = await fetchJsonWithTimeout(fetchImpl, tenMinPrimaryUrl, 5000);
       const parsed = parseCwaTemperature(json, stationId);
       if (parsed) return parsed;
     } catch {}
-    // 若預設北區站 C0X100 未出現在 10 分鐘資料集或維護，優先退回同為 10 分鐘的 467410 臺南氣象站
-    if (stationId === CWA_NORTH_STATION_ID) {
-      try {
-        const tenMinTainanUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${CWA_TAINAN_FALLBACK_ID}&format=JSON`;
-        const json = await fetchJsonWithTimeout(fetchImpl, tenMinTainanUrl, 5000);
-        const parsed = parseCwaTemperature(json, CWA_TAINAN_FALLBACK_ID);
-        if (parsed) return parsed;
-      } catch {}
-    }
-    // 最後備援：O-A0001-001 逐時資料
+    // 備援：退回 O-A0001-001（C0X100 臺南市北區）
+    const fbId = stationId === CWA_TAINAN_STATION_ID ? CWA_NORTH_STATION_ID : stationId;
     try {
-      const hourlyUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
+      const hourlyUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(fbId)}&format=JSON`;
       const json = await fetchJsonWithTimeout(fetchImpl, hourlyUrl, 5000);
-      return parseCwaTemperature(json, stationId);
+      return parseCwaTemperature(json, fbId);
     } catch {
       return null;
     }
@@ -1065,7 +1058,7 @@ export async function fetchWeatherReport(
 
   const payload = {
     ok: Boolean(tempData || aqiData || prev),
-    station: tempData?.station ?? prev?.station ?? '臺南市北區',
+    station: tempData?.station ?? prev?.station ?? '臺南',
     stationId: tempData?.stationId ?? prev?.stationId ?? stationId,
     temperature: tempData ? tempData.temperature : prev?.temperature ?? null,
     tempObsTime: tempData ? tempData.tempObsTime : prev?.tempObsTime ?? '',
