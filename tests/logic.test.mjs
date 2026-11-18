@@ -30,6 +30,7 @@ import {
   formatWeatherTime,
   aqiStatus,
   aqiLevel,
+  nextWeatherDelayMs,
   initLiveWeather,
   PIXEL_SHIFT_INTERVAL_MS,
   PIXEL_SHIFT_PATH,
@@ -46,6 +47,7 @@ import {
   IDLE_RELEASE_MS,
   CWA_NORTH_STATION_ID,
   WEATHER_CACHE_TTL_SEC,
+  shouldFetchAqi,
   normalizeEpochMs,
   withYahooCacheBuster,
   shouldAcceptQuote,
@@ -938,7 +940,7 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
     { aqiSite: '臺南', aqi: 68, aqiStatus: '普通', aqiPublishTime: '2026/11/18 14:00:00' },
   );
 
-  // 3. handleWeatherRequest：主站 C0X100 正常、單飛去重、5 分鐘邊緣快取 + 跨來源動態 CORS
+  // 3. handleWeatherRequest：主站 467410 正常、單飛去重、Edge Cache 獨立快取、失敗退回 C0X100
   const cacheMap = new Map();
   const mockCache = {
     match: async (k) => {
@@ -949,14 +951,20 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
       cacheMap.set(String(k), res.clone());
     },
   };
-  const weatherState = { inFlight: null, lastGood: null };
+  let nowWeatherMs = tpe('2026-11-18T17:05:00').getTime();
+  const weatherState = { inFlight: null, tempEntry: null, aqiEntry: null };
   let upstreamCalls = 0;
+  let cwaCalls = 0;
+  let moenvCalls = 0;
+  let moenvAqiTime = '2026/11/18 16:00:00';
+  let moenvAqiVal = '42';
   let primaryBroken = false;
 
   const mockFetch = async (url) => {
     upstreamCalls += 1;
     const u = String(url);
     if (u.includes('O-A0003-001')) {
+      cwaCalls += 1;
       assert.ok(u.includes('Authorization=cwa-secret'));
       assert.ok(u.includes('StationId=467410'));
       if (primaryBroken) return new Response(JSON.stringify({ records: { Station: [] } }), { status: 200 });
@@ -967,7 +975,7 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
               {
                 StationId: '467410',
                 StationName: '臺南',
-                ObsTime: { DateTime: '2026-11-18T15:40:00+08:00' },
+                ObsTime: { DateTime: '2026-11-18T17:00:00+08:00' },
                 WeatherElement: { AirTemperature: '28.2' },
               },
             ],
@@ -977,6 +985,7 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
       );
     }
     if (u.includes('O-A0001-001')) {
+      cwaCalls += 1;
       assert.ok(u.includes('StationId=C0X100'));
       return new Response(
         JSON.stringify({
@@ -985,7 +994,7 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
               {
                 StationId: 'C0X100',
                 StationName: '臺南市北區',
-                ObsTime: { DateTime: '2026-11-18T15:00:00+08:00' },
+                ObsTime: { DateTime: '2026-11-18T17:00:00+08:00' },
                 WeatherElement: { AirTemperature: '28.3' },
               },
             ],
@@ -995,10 +1004,11 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
       );
     }
     if (u.includes('aqx_p_432')) {
+      moenvCalls += 1;
       assert.ok(u.includes('api_key=moenv-secret'));
       return new Response(
         JSON.stringify({
-          records: [{ sitename: '臺南', aqi: '42', status: '良好', publishtime: '2026/11/18 14:00:00' }],
+          records: [{ sitename: '臺南', aqi: moenvAqiVal, status: '良好', publishtime: moenvAqiTime }],
         }),
         { status: 200 },
       );
@@ -1011,12 +1021,12 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
     handleWeatherRequest(
       new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
       envWeather,
-      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
     ),
     handleWeatherRequest(
       new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
       envWeather,
-      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
     ),
   ]);
   assert.equal(upstreamCalls, 2, 'concurrent hits share one CWA + one MOENV fetch');
@@ -1026,34 +1036,103 @@ test('氣象署 CWA（臺南 467410 10分鐘資料）與環境部 MOENV（臺南
   assert.equal(jA.stationId, '467410');
   assert.equal(jA.temperature, 28.2);
   assert.equal(jA.aqi, 42);
-  assert.equal(jA.aqiStatus, '良好');
+  assert.equal(jA.aqiUpdatedThisHour, false);
   assert.equal(jB.aqi, 42);
   assert.equal(JSON.stringify(jA).includes('secret'), false);
 
-  // 快取命中應支援不同允許網域的動態 CORS Header，且不再增加上游呼叫
+  // 快取命中應支援不同允許網域的動態 CORS Header，且 30 秒內不再增加上游呼叫
+  nowWeatherMs += 30 * 1000; // 17:05:30
   const rLocal = await handleWeatherRequest(
     new Request('https://w.example/api/weather', { headers: { Origin: 'http://localhost:8080' } }),
     envWeather,
-    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
   );
   assert.equal(rLocal.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
   assert.equal(upstreamCalls, 2);
 
-  // 清除快取並模擬 467410 缺值 -> 自動退回 C0X100 臺南市北區站備援
+  // 4. AQI 專屬排程：17:06（尚無 17:00）只重抓 MOENV、不重打 CWA；17:07 拿到 17:00 新資料後徹底停止抓 MOENV，直到 18:05
+  nowWeatherMs = tpe('2026-11-18T17:06:00').getTime();
+  const cwaBefore06 = cwaCalls;
+  await handleWeatherRequest(
+    new Request('https://w.example/api/weather'),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
+  );
+  assert.equal(cwaCalls, cwaBefore06, 'temp stays cached for 3 minutes');
+  assert.equal(moenvCalls, 2, 'AQI retries after 1 minute during :05-:20');
+
+  // 17:07 環境部釋出 17:00 新資料（模擬孤兒 isolate 重建 state = 空，驗證仍能靠 Edge Cache 持久記住本小時已取過）
+  nowWeatherMs = tpe('2026-11-18T17:07:00').getTime();
+  moenvAqiTime = '2026/11/18 17:00:00';
+  moenvAqiVal = '51';
+  const r17 = await handleWeatherRequest(
+    new Request('https://w.example/api/weather'),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
+  );
+  const j17 = await r17.json();
+  assert.equal(j17.aqi, 51);
+  assert.equal(j17.aqiUpdatedThisHour, true);
+  assert.equal(moenvCalls, 3);
+
+  // 17:10 與 18:04：即使氣溫滿 3 分鐘重抓，AQI 已在本小時抓過（或未到下小時 :05）→ MOENV 呼叫次數完全維持 3
+  nowWeatherMs = tpe('2026-11-18T17:10:00').getTime();
+  await handleWeatherRequest(
+    new Request('https://w.example/api/weather'),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: { inFlight: null, tempEntry: null, aqiEntry: null }, nowFn: () => nowWeatherMs },
+  );
+  assert.equal(cwaCalls, cwaBefore06 + 1, 'temp refreshed after 3 minutes');
+  assert.equal(moenvCalls, 3, 'MOENV must stay 0 additional calls once hour captured');
+
+  nowWeatherMs = tpe('2026-11-18T18:04:00').getTime();
+  await handleWeatherRequest(
+    new Request('https://w.example/api/weather'),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
+  );
+  assert.equal(moenvCalls, 3, 'MOENV must wait until 18:05');
+
+  // 18:05 進入下一個小時的 5 分：恢復向 MOENV 抓取下一小時資料
+  nowWeatherMs = tpe('2026-11-18T18:05:00').getTime();
+  await handleWeatherRequest(
+    new Request('https://w.example/api/weather'),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState, nowFn: () => nowWeatherMs },
+  );
+  assert.equal(moenvCalls, 4);
+
+  // 5. 純函式 shouldFetchAqi 邊界驗證
+  assert.equal(
+    shouldFetchAqi(
+      { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T16:12:00').getTime() },
+      tpe('2026-11-18T17:04:59').getTime(),
+    ),
+    false,
+  );
+  assert.equal(
+    shouldFetchAqi(
+      { data: { aqiPublishTime: '2026/11/18 16:00:00' }, lastAttemptMs: tpe('2026-11-18T16:12:00').getTime() },
+      tpe('2026-11-18T17:21:00').getTime(),
+    ),
+    false,
+  );
+
+  // 6. 清除快取並模擬 467410 缺值 -> 自動退回 C0X100 臺南市北區站備援
   cacheMap.clear();
   primaryBroken = true;
   const rFb = await handleWeatherRequest(
     new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
     envWeather,
-    { fetchImpl: mockFetch, cacheStore: mockCache, state: { inFlight: null, lastGood: null } },
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: { inFlight: null, tempEntry: null, aqiEntry: null }, nowFn: () => nowWeatherMs },
   );
   const jFb = await rFb.json();
   assert.equal(jFb.stationId, 'C0X100');
   assert.equal(jFb.temperature, 28.3);
 });
 
-test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM 更新）', async () => {
-  const nowMs = tpe('2026-11-18T15:05:00').getTime();
+test('前端頂部氣象/空品元件（formatWeatherTime、動態 05–20 分 1 分鐘排程／其餘 3 分鐘、DOM 更新與卸載清除）', async () => {
+  let nowMs = tpe('2026-11-18T15:05:00').getTime();
   assert.equal(formatWeatherTime('2026-11-18T14:50:00+08:00', true, nowMs), '14:50');
   assert.equal(formatWeatherTime('2026/11/18 14:00:00', false, nowMs), '14:00');
   assert.equal(formatWeatherTime('2026/11/17 23:00:00', false, nowMs), '11/17 23:00');
@@ -1066,6 +1145,13 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   assert.equal(aqiLevel(120), 2);
   assert.equal(aqiLevel(220), 4);
 
+  // nextWeatherDelayMs 排程邏輯：
+  // 15:03 缺本小時資料 -> 對齊 15:05:02（122s < 180s）喚醒；15:05 缺資料 -> 60s；15:08 已拿到 15:00 -> 回到 180s
+  assert.equal(nextWeatherDelayMs('2026/11/18 14:00:00', tpe('2026-11-18T15:03:00').getTime()), 122000);
+  assert.equal(nextWeatherDelayMs('2026/11/18 14:00:00', tpe('2026-11-18T15:05:00').getTime()), 60000);
+  assert.equal(nextWeatherDelayMs('2026/11/18 15:00:00', tpe('2026-11-18T15:08:00').getTime()), 180000);
+  assert.equal(nextWeatherDelayMs('2026/11/18 14:00:00', tpe('2026-11-18T15:25:00').getTime()), 180000);
+
   const makeEl = () => ({
     textContent: '',
     attrs: new Map(),
@@ -1076,15 +1162,21 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   const tempEl = makeEl();
   const timeEl = makeEl();
   const aqiEl = makeEl();
-  let intervalRegistered = null;
+  const scheduled = new Map();
+  let nextTimerId = 1;
+  let serverAqiTime = '2026/11/18 14:00:00';
+  let serverAqiVal = 78;
+  let serverAqiStatus = '普通';
 
   const ctl = initLiveWeather({
     apiOrigin: 'https://cmoney-taiex.example.workers.dev',
     nowFn: () => nowMs,
-    setIntervalFn: (_fn, ms) => {
-      intervalRegistered = ms;
-      return 1;
+    setTimeoutFn: (fn, ms) => {
+      const id = nextTimerId++;
+      scheduled.set(id, { fn, ms });
+      return id;
     },
+    clearTimeoutFn: (id) => scheduled.delete(id),
     documentRef: {
       querySelectorAll(sel) {
         if (sel === '[data-live-temp]') return [tempEl];
@@ -1099,13 +1191,13 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
       return new Response(
         JSON.stringify({
           ok: true,
-          station: '臺南市北區',
+          station: '臺南',
           temperature: 26.8,
           tempObsTime: '2026-11-18T14:50:00+08:00',
           aqiSite: '臺南',
-          aqi: 78,
-          aqiStatus: '普通',
-          aqiPublishTime: '2026/11/18 14:00:00',
+          aqi: serverAqiVal,
+          aqiStatus: serverAqiStatus,
+          aqiPublishTime: serverAqiTime,
         }),
         { status: 200 },
       );
@@ -1118,7 +1210,23 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   assert.equal(WEATHER_CACHE_TTL_SEC, 180);
   assert.equal(aqiEl.textContent, '空氣品質：普通 AQI 78 (14:00)');
   assert.equal(aqiEl.attrs.get('data-aqi-level'), '1');
-  assert.equal(intervalRegistered, 3 * 60 * 1000);
+  // 15:05 只收到 14:00 舊資料 -> 下一次排 60 秒（1 分鐘追擊）
+  assert.equal([...scheduled.values()][0].ms, 60 * 1000);
+
+  // 模擬 15:08 抓到 15:00 新資料 -> 立即切換回 3 分鐘（180s）循環
+  nowMs = tpe('2026-11-18T15:08:00').getTime();
+  serverAqiTime = '2026/11/18 15:00:00';
+  serverAqiVal = 45;
+  serverAqiStatus = '良好';
+  const [tid, timerObj] = [...scheduled.entries()][0];
+  scheduled.delete(tid);
+  await timerObj.fn();
+  assert.equal(aqiEl.textContent, '空氣品質：良好 AQI 45 (15:00)');
+  assert.equal(aqiEl.attrs.get('data-aqi-level'), '0');
+  assert.equal([...scheduled.values()][0].ms, 3 * 60 * 1000);
+
+  ctl.stop();
+  assert.equal(scheduled.size, 0);
 });
 
 test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑循環位移且卸載時 clearInterval', () => {

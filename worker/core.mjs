@@ -942,8 +942,41 @@ export const CWA_TAINAN_STATION_ID = '467410'; // 臺南氣象站（每 10 分�
 export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站（備援）
 export const CWA_TAINAN_FALLBACK_ID = '467410';
 export const MOENV_TAINAN_SITE = '臺南';
-export const WEATHER_CACHE_TTL_SEC = 180; // 3 分鐘邊緣快取，對齊雙站每 3 分鐘更新一次
-const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v3';
+export const WEATHER_CACHE_TTL_SEC = 180; // 氣溫每 3 分鐘更新一次
+export const WEATHER_TEMP_TTL_MS = 175 * 1000;
+export const AQI_HUNT_INTERVAL_MS = 55 * 1000; // 每小時 5～20 分期間每 1 分鐘嘗試一次
+export const AQI_HUNT_START_MIN = 5;
+export const AQI_HUNT_END_MIN = 20;
+export const AQI_STALE_MS = 2 * 3600 * 1000;
+const WEATHER_TEMP_CACHE_KEY = 'https://cache.cmoney.local/api/weather-temp-v1';
+const WEATHER_AQI_CACHE_KEY = 'https://cache.cmoney.local/api/weather-aqi-v1';
+
+/**
+ * 判斷此刻是否需要向環境部抓取 AQI（台北時間）：
+ *  - 若已有「本小時」新資料（storedHour >= currentHour），立即停止抓取直到下個小時的 05 分
+ *  - 否則僅於每小時 05～20 分之間每 1 分鐘嘗試抓取一次（冷啟動缺資料或落後逾 2 小時除外）
+ */
+export function shouldFetchAqi(cachedEntry, nowMs = Date.now()) {
+  const attemptedRecently = Boolean(
+    cachedEntry?.lastAttemptMs && nowMs - cachedEntry.lastAttemptMs < AQI_HUNT_INTERVAL_MS,
+  );
+  if (attemptedRecently) return false;
+
+  const aqiData = cachedEntry?.data;
+  if (!aqiData?.aqiPublishTime) return true; // 尚無任何 AQI 資料（冷啟動）先抓一次
+
+  const { date, time } = taipeiNowParts(new Date(nowMs));
+  const currentHour = `${date.replace(/-/g, '/')} ${time.slice(0, 2)}`;
+  const minute = Number(time.slice(3, 5));
+  const storedHour = String(aqiData.aqiPublishTime).slice(0, 13);
+
+  if (storedHour >= currentHour) return false; // 已抓到本小時最新 AQI，不再抓
+
+  const pubMs = Date.parse(`${String(aqiData.aqiPublishTime).replace(/\//g, '-').replace(' ', 'T')}+08:00`);
+  if (!Number.isFinite(pubMs) || nowMs - pubMs > AQI_STALE_MS) return true;
+
+  return minute >= AQI_HUNT_START_MIN && minute <= AQI_HUNT_END_MIN;
+}
 
 export function computeAqiStatus(aqi) {
   if (aqi <= 50) return '良好';
@@ -1001,12 +1034,44 @@ async function fetchJsonWithTimeout(fetchImpl, url, timeoutMs = 5000) {
   }
 }
 
-const defaultWeatherState = { inFlight: null, lastGood: null };
+const defaultWeatherState = { inFlight: null, tempEntry: null, aqiEntry: null };
+
+async function readEdgeJson(cacheStore, key) {
+  if (!cacheStore) return null;
+  try {
+    const hit = await cacheStore.match(key);
+    return hit ? await hit.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeEdgeJson(cacheStore, key, value, maxAgeSec) {
+  if (!cacheStore) return;
+  try {
+    await cacheStore.put(
+      key,
+      new Response(JSON.stringify(value), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': `public, max-age=${maxAgeSec}`,
+        },
+      }),
+    );
+  } catch {}
+}
 
 export async function fetchWeatherReport(
   env,
-  { fetchImpl = globalThis.fetch.bind(globalThis), state = defaultWeatherState } = {},
+  {
+    fetchImpl = globalThis.fetch.bind(globalThis),
+    cacheStore = null,
+    state = defaultWeatherState,
+    nowFn = () => Date.now(),
+  } = {},
 ) {
+  const nowMs = nowFn();
   const cwaKey = String(env?.CWA_API_KEY || '').trim();
   const moenvKey = String(env?.MOENV_API_KEY || '').trim();
   const stationId = String(env?.CWA_STATION_ID || CWA_TAINAN_STATION_ID).trim() || CWA_TAINAN_STATION_ID;
@@ -1016,16 +1081,29 @@ export async function fetchWeatherReport(
   if (!cwaKey) missingKeys.push('CWA_API_KEY');
   if (!moenvKey) missingKeys.push('MOENV_API_KEY');
 
+  let tempEntry = state?.tempEntry && state.tempEntry.requestedStation === stationId ? state.tempEntry : null;
+  if (!tempEntry && cacheStore) {
+    const edgeTemp = await readEdgeJson(cacheStore, WEATHER_TEMP_CACHE_KEY);
+    if (edgeTemp?.requestedStation === stationId) tempEntry = edgeTemp;
+  }
+
+  let aqiEntry = state?.aqiEntry && aqiEntryMatch(state.aqiEntry, siteName) ? state.aqiEntry : null;
+  if (!aqiEntry && cacheStore) {
+    const edgeAqi = await readEdgeJson(cacheStore, WEATHER_AQI_CACHE_KEY);
+    if (aqiEntryMatch(edgeAqi, siteName)) aqiEntry = edgeAqi;
+  }
+
+  const needTempFetch = Boolean(cwaKey && (!tempEntry?.data || nowMs - tempEntry.fetchedAtMs >= WEATHER_TEMP_TTL_MS));
+  const needAqiFetch = Boolean(moenvKey && shouldFetchAqi(aqiEntry, nowMs));
+
   const fetchTemp = async () => {
-    if (!cwaKey) return null;
-    // 直接查詢 O-A0003-001（467410 臺南氣象站，每 10 分鐘一筆）
+    if (!needTempFetch) return null;
     const tenMinPrimaryUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
     try {
       const json = await fetchJsonWithTimeout(fetchImpl, tenMinPrimaryUrl, 5000);
       const parsed = parseCwaTemperature(json, stationId);
       if (parsed) return parsed;
     } catch {}
-    // 備援：退回 O-A0001-001（C0X100 臺南市北區）
     const fbId = stationId === CWA_TAINAN_STATION_ID ? CWA_NORTH_STATION_ID : stationId;
     try {
       const hourlyUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(fbId)}&format=JSON`;
@@ -1037,43 +1115,61 @@ export async function fetchWeatherReport(
   };
 
   const fetchAqi = async () => {
-    if (!moenvKey) return null;
+    if (!needAqiFetch) return { skipped: true, data: null };
     try {
       const url = `${MOENV_AQI_URL}?api_key=${encodeURIComponent(moenvKey)}&limit=10&format=json&filters=${encodeURIComponent(`sitename,EQ,${siteName}`)}`;
       const json = await fetchJsonWithTimeout(fetchImpl, url, 5000);
-      return parseMoenvAqi(json, siteName);
+      return { skipped: false, data: parseMoenvAqi(json, siteName) };
     } catch {
-      return null;
+      return { skipped: false, data: null };
     }
   };
 
   const [tempRes, aqiRes] = await Promise.allSettled([fetchTemp(), fetchAqi()]);
-  const tempData = tempRes.status === 'fulfilled' ? tempRes.value : null;
-  const aqiData = aqiRes.status === 'fulfilled' ? aqiRes.value : null;
+  const freshTemp = tempRes.status === 'fulfilled' ? tempRes.value : null;
+  const aqiOutcome = aqiRes.status === 'fulfilled' ? aqiRes.value : { skipped: !needAqiFetch, data: null };
 
-  const prev =
-    state?.lastGood && state.lastGood.requestedStation === stationId && state.lastGood.requestedSite === siteName
-      ? state.lastGood.payload
-      : null;
-
-  const payload = {
-    ok: Boolean(tempData || aqiData || prev),
-    station: tempData?.station ?? prev?.station ?? '臺南',
-    stationId: tempData?.stationId ?? prev?.stationId ?? stationId,
-    temperature: tempData ? tempData.temperature : prev?.temperature ?? null,
-    tempObsTime: tempData ? tempData.tempObsTime : prev?.tempObsTime ?? '',
-    aqiSite: aqiData?.aqiSite ?? prev?.aqiSite ?? siteName,
-    aqi: aqiData ? aqiData.aqi : prev?.aqi ?? null,
-    aqiStatus: aqiData ? aqiData.aqiStatus : prev?.aqiStatus ?? '',
-    aqiPublishTime: aqiData ? aqiData.aqiPublishTime : prev?.aqiPublishTime ?? '',
-    missingKeys,
-    updatedAt: new Date().toISOString(),
-  };
-
-  if (state && (tempData || aqiData)) {
-    state.lastGood = { requestedStation: stationId, requestedSite: siteName, payload };
+  if (freshTemp) {
+    tempEntry = { requestedStation: stationId, fetchedAtMs: nowMs, data: freshTemp };
+    if (state) state.tempEntry = tempEntry;
+    if (cacheStore && cwaKey && moenvKey) {
+      await writeEdgeJson(cacheStore, WEATHER_TEMP_CACHE_KEY, tempEntry, 300);
+    }
   }
-  return payload;
+
+  if (needAqiFetch && !aqiOutcome.skipped) {
+    const nextAqiData = aqiOutcome.data || aqiEntry?.data || null;
+    aqiEntry = { requestedSite: siteName, lastAttemptMs: nowMs, data: nextAqiData };
+    if (state) state.aqiEntry = aqiEntry;
+    if (cacheStore && cwaKey && moenvKey) {
+      await writeEdgeJson(cacheStore, WEATHER_AQI_CACHE_KEY, aqiEntry, 7200);
+    }
+  }
+
+  const tempData = tempEntry?.data ?? null;
+  const aqiData = aqiEntry?.data ?? null;
+  const { date, time } = taipeiNowParts(new Date(nowMs));
+  const currentHour = `${date.replace(/-/g, '/')} ${time.slice(0, 2)}`;
+  const aqiUpdatedThisHour = Boolean(aqiData?.aqiPublishTime && String(aqiData.aqiPublishTime).slice(0, 13) >= currentHour);
+
+  return {
+    ok: Boolean(tempData || aqiData),
+    station: tempData?.station ?? '臺南',
+    stationId: tempData?.stationId ?? stationId,
+    temperature: tempData ? tempData.temperature : null,
+    tempObsTime: tempData ? tempData.tempObsTime : '',
+    aqiSite: aqiData?.aqiSite ?? siteName,
+    aqi: aqiData ? aqiData.aqi : null,
+    aqiStatus: aqiData ? aqiData.aqiStatus : '',
+    aqiPublishTime: aqiData ? aqiData.aqiPublishTime : '',
+    aqiUpdatedThisHour,
+    missingKeys,
+    updatedAt: new Date(nowMs).toISOString(),
+  };
+}
+
+function aqiEntryMatch(entry, siteName) {
+  return Boolean(entry && entry.requestedSite === siteName);
 }
 
 export async function handleWeatherRequest(
@@ -1083,30 +1179,14 @@ export async function handleWeatherRequest(
     fetchImpl = globalThis.fetch.bind(globalThis),
     cacheStore = typeof caches !== 'undefined' ? caches.default : null,
     state = defaultWeatherState,
+    nowFn = () => Date.now(),
   } = {},
 ) {
-  const canUseEdgeCache = Boolean(cacheStore && env?.CWA_API_KEY && env?.MOENV_API_KEY);
-
-  if (canUseEdgeCache) {
-    try {
-      const hit = await cacheStore.match(WEATHER_EDGE_CACHE_KEY);
-      if (hit) {
-        const body = await hit.text();
-        return new Response(body, {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`,
-            ...buildCorsHeaders(request, env),
-          },
-        });
-      }
-    } catch {}
-  }
+  const effectiveCache = env?.CWA_API_KEY && env?.MOENV_API_KEY ? cacheStore : null;
 
   let task = state?.inFlight;
   if (!task) {
-    task = fetchWeatherReport(env, { fetchImpl, state }).finally(() => {
+    task = fetchWeatherReport(env, { fetchImpl, cacheStore: effectiveCache, state, nowFn }).finally(() => {
       if (state) state.inFlight = null;
     });
     if (state) state.inFlight = task;
@@ -1115,20 +1195,10 @@ export async function handleWeatherRequest(
   const jsonText = JSON.stringify(payload);
   const hasAnyData = payload.temperature != null || payload.aqi != null;
 
-  if (canUseEdgeCache && hasAnyData && payload.missingKeys.length === 0) {
-    try {
-      await cacheStore.put(
-        WEATHER_EDGE_CACHE_KEY,
-        new Response(jsonText, {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Cache-Control': `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`,
-          },
-        }),
-      );
-    } catch {}
-  }
+  const { time } = taipeiNowParts(new Date(nowFn()));
+  const minute = Number(time.slice(3, 5));
+  const inAqiHunt = !payload.aqiUpdatedThisHour && minute >= AQI_HUNT_START_MIN && minute <= AQI_HUNT_END_MIN;
+  const maxAge = inAqiHunt ? 55 : WEATHER_CACHE_TTL_SEC;
 
   return new Response(jsonText, {
     status: hasAnyData || payload.missingKeys.length > 0 ? 200 : 502,
@@ -1136,7 +1206,7 @@ export async function handleWeatherRequest(
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control':
         hasAnyData && payload.missingKeys.length === 0
-          ? `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`
+          ? `public, max-age=${maxAge}, s-maxage=${maxAge}`
           : 'no-store, no-cache, must-revalidate',
       ...buildCorsHeaders(request, env),
     },

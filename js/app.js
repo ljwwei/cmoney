@@ -614,9 +614,29 @@ export async function initVisitCounter({
 }
 
 /* ========================================================
-   臺南市北區氣溫 & 臺南測站 AQI（同民德市政府官網規格）
+   臺南市氣溫（3 分鐘）& 臺南測站 AQI（每小時 05～20 分每 1 分鐘抓取至取得新資料為止）
    ======================================================== */
 export const WEATHER_REFRESH_MS = 3 * 60 * 1000;
+export const WEATHER_AQI_HUNT_MS = 60 * 1000;
+
+export function nextWeatherDelayMs(aqiPublishTime, nowMs = Date.now(), refreshMs = WEATHER_REFRESH_MS) {
+  const tw = new Date(nowMs + 8 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const currentHour = `${tw.getUTCFullYear()}/${pad(tw.getUTCMonth() + 1)}/${pad(tw.getUTCDate())} ${pad(tw.getUTCHours())}`;
+  const minute = tw.getUTCMinutes();
+  const sec = tw.getUTCSeconds();
+  const storedHour = String(aqiPublishTime || '').slice(0, 13);
+  const needAqi = !storedHour || storedHour < currentHour;
+
+  if (needAqi && minute >= 5 && minute <= 20) {
+    return WEATHER_AQI_HUNT_MS;
+  }
+  if (needAqi && minute < 5) {
+    const msTo05 = ((5 - minute) * 60 - sec) * 1000 + 2000;
+    return Math.max(1000, Math.min(refreshMs, msTo05));
+  }
+  return refreshMs;
+}
 
 export function formatWeatherTime(raw, hasOffset, nowMs = Date.now()) {
   if (!raw) return '';
@@ -670,8 +690,8 @@ export function initLiveWeather({
   fetchImpl = typeof globalThis !== 'undefined' && globalThis.fetch ? globalThis.fetch.bind(globalThis) : null,
   documentRef = typeof document !== 'undefined' ? document : null,
   nowFn = () => Date.now(),
-  setIntervalFn = setInterval,
-  clearIntervalFn = clearInterval,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
   refreshMs = WEATHER_REFRESH_MS,
 } = {}) {
   const tempEls = documentRef?.querySelectorAll?.('[data-live-temp]') ?? [];
@@ -680,6 +700,9 @@ export function initLiveWeather({
   if ((!tempEls.length && !aqiEls.length) || !apiOrigin || !fetchImpl) return null;
 
   let lastFetchedAt = 0;
+  let lastAqiPublishTime = '';
+  let timerId = null;
+  let stopped = false;
 
   function setTemp(text, timeText) {
     tempEls.forEach((el) => {
@@ -697,6 +720,23 @@ export function initLiveWeather({
     });
   }
 
+  function clearTimer() {
+    if (timerId != null) {
+      clearTimeoutFn(timerId);
+      timerId = null;
+    }
+  }
+
+  function scheduleNext() {
+    clearTimer();
+    if (stopped) return;
+    const delay = nextWeatherDelayMs(lastAqiPublishTime, nowFn(), refreshMs);
+    timerId = setTimeoutFn(() => {
+      timerId = null;
+      return runCycle();
+    }, delay);
+  }
+
   async function refresh() {
     try {
       const res = await fetchImpl(`${apiOrigin}/api/weather?_t=${nowFn()}`, {
@@ -705,6 +745,7 @@ export function initLiveWeather({
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json();
       lastFetchedAt = nowFn();
+      if (d?.aqiPublishTime) lastAqiPublishTime = d.aqiPublishTime;
 
       const t = parseFloat(d?.temperature);
       setTemp(Number.isNaN(t) ? '--' : t.toFixed(1), Number.isNaN(t) ? '' : formatWeatherTime(d.tempObsTime, true, nowFn()));
@@ -726,20 +767,29 @@ export function initLiveWeather({
     }
   }
 
-  const initialPromise = refresh();
-  let intervalId = setIntervalFn(refresh, refreshMs);
+  async function runCycle() {
+    if (stopped) return null;
+    const data = await refresh();
+    scheduleNext();
+    return data;
+  }
+
+  const initialPromise = runCycle();
 
   return {
     refresh,
     onVisibilityShow() {
-      if (nowFn() - lastFetchedAt >= refreshMs) refresh();
-    },
-    stop() {
-      if (intervalId != null) {
-        clearIntervalFn(intervalId);
-        intervalId = null;
+      const minWait = Math.min(nextWeatherDelayMs(lastAqiPublishTime, nowFn(), refreshMs), refreshMs);
+      if (!stopped && nowFn() - lastFetchedAt >= minWait) {
+        clearTimer();
+        runCycle();
       }
     },
+    stop() {
+      stopped = true;
+      clearTimer();
+    },
+    getNextDelayMs: () => nextWeatherDelayMs(lastAqiPublishTime, nowFn(), refreshMs),
     initialPromise,
   };
 }
