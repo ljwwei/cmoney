@@ -42,7 +42,8 @@
 ## 專案結構
 
 ```
-index.html, css/style.css, js/app.js   前端（單例 EventSource SSE、單調時間戳、僅顯示富果/Yahoo備援標籤、頁尾人數計次）
+index.html, css/style.css, js/app.js   前端（PWA、單例 EventSource SSE、單調時間戳、OLED 防烙印位移、頁尾人數計次）
+manifest.json, sw.js, icons/           Web App Manifest、Network-First／行情 Network-Only Service Worker 與深色圖示
 data/data.json                         盤後抓取結果（由 Actions 自動 commit）
 scripts/fetch.mjs, parsers.mjs, schedule.mjs   盤後抓取／解析／排程模組
 worker/core.mjs                        Fugle WS 單例引擎、Yahoo 條件備援、SSE 與計次純邏輯（可供 Node 單元測試）

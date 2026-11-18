@@ -1137,11 +1137,33 @@ async function load() {
   syncLiveLifecycle();
 }
 
+export function registerServiceWorker({
+  navigatorRef = typeof navigator !== 'undefined' ? navigator : null,
+  locationRef = typeof location !== 'undefined' ? location : null,
+} = {}) {
+  if (!navigatorRef?.serviceWorker?.register) return null;
+  const proto = locationRef?.protocol ?? '';
+  const host = locationRef?.hostname ?? '';
+  const allowed = proto === 'https:' || host === 'localhost' || host === '127.0.0.1';
+  if (!allowed) return null;
+  return navigatorRef.serviceWorker
+    .register('./sw.js', { scope: './' })
+    .then((reg) => {
+      reg?.update?.().catch?.(() => {});
+      return reg;
+    })
+    .catch((err) => {
+      console.warn('Service Worker 註冊失敗', err?.message ?? err);
+      return null;
+    });
+}
+
 let liveController = null;
 let weatherController = null;
 let pixelShiftController = null;
 
 if (typeof document !== 'undefined') {
+  registerServiceWorker();
   const apiOrigin = resolveApiOrigin();
   liveController = createLiveStreamController({
     apiOrigin,

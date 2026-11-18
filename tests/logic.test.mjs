@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { dueTasks, remainingTasks, isTradingDay, taipeiParts, institutionalStage } from '../scripts/schedule.mjs';
 import {
   parseHolidays,
@@ -38,6 +39,7 @@ import {
   snapCssOffset,
   buildCrispShiftSteps,
   initPixelShift,
+  registerServiceWorker,
   FALLBACK_POLL_MS,
 } from '../js/app.js';
 import {
@@ -1458,4 +1460,188 @@ test('外資台股期貨空單：多日 CSV 前一交易日解析與渲染（增
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.ok(html.includes('<h2 id="t-fut">外資台股期貨空單</h2>'));
   assert.ok(!html.includes('外資台股期貨未平倉'));
+});
+
+test('PWA 完整設定：Manifest、PNG 圖示尺寸、Safe Area、與 Service Worker（靜態 Network-First / 行情 Network-Only）', async () => {
+  // 1) Web App Manifest 規格驗證
+  const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+  assert.equal(manifest.name, '台股盤中即時看板');
+  assert.equal(manifest.short_name, '台股即時');
+  assert.equal(manifest.display, 'standalone');
+  assert.equal(manifest.start_url, './');
+  assert.equal(manifest.scope, './');
+  assert.equal(manifest.background_color, '#0b1220');
+  assert.equal(manifest.theme_color, '#0b1220');
+
+  const pngSig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const iconExpectations = [
+    ['icons/icon-192.png', 192, 'any'],
+    ['icons/icon-512.png', 512, 'any'],
+    ['icons/icon-512-maskable.png', 512, 'maskable'],
+  ];
+  for (const [src, dim, purpose] of iconExpectations) {
+    assert.ok(manifest.icons.some((i) => i.src === src && i.sizes === `${dim}x${dim}` && i.purpose === purpose));
+    const png = readFileSync(new URL(`../${src}`, import.meta.url));
+    assert.ok(png.subarray(0, 8).equals(pngSig));
+    assert.equal(png.readUInt32BE(16), dim);
+    assert.equal(png.readUInt32BE(20), dim);
+  }
+  const applePng = readFileSync(new URL('../icons/apple-touch-icon.png', import.meta.url));
+  assert.ok(applePng.subarray(0, 8).equals(pngSig));
+  assert.equal(applePng.readUInt32BE(16), 180);
+  assert.equal(applePng.readUInt32BE(20), 180);
+
+  // 2) HTML <head> PWA / iOS / Android 標籤與 CSS Safe Area 驗證
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.ok(html.includes('name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"'));
+  assert.ok(html.includes('name="theme-color" content="#0b1220"'));
+  assert.ok(html.includes('name="apple-mobile-web-app-capable" content="yes"'));
+  assert.ok(html.includes('name="apple-mobile-web-app-status-bar-style" content="black-translucent"'));
+  assert.ok(html.includes('rel="manifest" href="manifest.json"'));
+  assert.ok(html.includes('rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png"'));
+
+  const css = readFileSync(new URL('../css/style.css', import.meta.url), 'utf8');
+  assert.ok(css.includes('padding-top: env(safe-area-inset-top);'));
+  assert.ok(css.includes('padding-bottom: env(safe-area-inset-bottom);'));
+
+  // 3) registerServiceWorker 註冊與環境安全守門
+  let regCalls = [];
+  let updateCalled = false;
+  assert.equal(
+    registerServiceWorker({
+      navigatorRef: { serviceWorker: { register: () => Promise.resolve({}) } },
+      locationRef: { protocol: 'http:', hostname: 'example.com' },
+    }),
+    null,
+  );
+  await registerServiceWorker({
+    navigatorRef: {
+      serviceWorker: {
+        register: (path, opts) => {
+          regCalls.push([path, opts]);
+          return Promise.resolve({
+            update: () => {
+              updateCalled = true;
+              return Promise.resolve();
+            },
+          });
+        },
+      },
+    },
+    locationRef: { protocol: 'https:', hostname: 'ljwwei.github.io' },
+  });
+  assert.deepEqual(regCalls, [['./sw.js', { scope: './' }]]);
+  assert.equal(updateCalled, true);
+
+  // 4) sw.js 策略實測（install skipWaiting、activate 清除舊快取＋claim、行情 Network-Only、靜態 Network-First）
+  const swSrc = readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+  const listeners = new Map();
+  const store = new Map([['cmoney-old-v0', new Map()]]);
+  let skipWaitingCalled = false;
+  let claimedCalled = false;
+  let fetchResponder = async () => new Response('net-default', { status: 200 });
+
+  const cacheObj = (map) => ({
+    put: async (k, v) => {
+      const u = typeof k === 'string' ? k : new URL(k.url).pathname;
+      map.set(u, v);
+    },
+    match: async (k) => {
+      const u = typeof k === 'string' ? k : new URL(k.url).pathname;
+      return map.get(u);
+    },
+  });
+
+  const sandbox = {
+    URL,
+    Request,
+    Response,
+    Promise,
+    self: {
+      location: { origin: 'https://ljwwei.github.io', href: 'https://ljwwei.github.io/cmoney/sw.js' },
+      addEventListener: (ev, fn) => listeners.set(ev, fn),
+      skipWaiting: () => {
+        skipWaitingCalled = true;
+      },
+      clients: {
+        claim: () => {
+          claimedCalled = true;
+          return Promise.resolve();
+        },
+      },
+    },
+    caches: {
+      open: async (name) => {
+        if (!store.has(name)) store.set(name, new Map());
+        return cacheObj(store.get(name));
+      },
+      keys: async () => [...store.keys()],
+      delete: async (name) => store.delete(name),
+      match: async (k) => {
+        const key = typeof k === 'string' ? (k === './index.html' ? '/cmoney/index.html' : k) : new URL(k.url).pathname;
+        for (const map of store.values()) {
+          if (map.has(key)) return map.get(key);
+        }
+        return undefined;
+      },
+    },
+    fetch: (...args) => fetchResponder(...args),
+  };
+  vm.runInNewContext(swSrc, sandbox);
+
+  const installWait = [];
+  listeners.get('install')({ waitUntil: (p) => installWait.push(p) });
+  await Promise.all(installWait);
+  assert.equal(skipWaitingCalled, true);
+
+  const activateWait = [];
+  listeners.get('activate')({ waitUntil: (p) => activateWait.push(p) });
+  await Promise.all(activateWait);
+  assert.equal(claimedCalled, true);
+  assert.equal(store.has('cmoney-old-v0'), false);
+
+  // 4a) 行情 SSE / Worker API / data.json / POST 絕不呼叫 respondWith（一律 Network-Only）
+  const dispatchFetch = (req) => {
+    let responded = null;
+    const waits = [];
+    listeners.get('fetch')({
+      request: req,
+      respondWith: (p) => {
+        responded = p;
+      },
+      waitUntil: (p) => waits.push(p),
+    });
+    return { responded, waits };
+  };
+
+  for (const noCacheUrl of [
+    'https://cmoney-taiex.gamerwillywilly.workers.dev/api/stream',
+    'https://cmoney-taiex.gamerwillywilly.workers.dev/api/taiex',
+    'https://cmoney-taiex.gamerwillywilly.workers.dev/api/weather',
+    'https://ljwwei.github.io/cmoney/api/quote',
+    'https://ljwwei.github.io/cmoney/data/data.json?t=123',
+  ]) {
+    const r = dispatchFetch(new Request(noCacheUrl, { method: 'GET' }));
+    assert.equal(r.responded, null, `不應攔截即時行情/API: ${noCacheUrl}`);
+  }
+  assert.equal(
+    dispatchFetch(new Request('https://ljwwei.github.io/cmoney/index.html', { method: 'POST' })).responded,
+    null,
+  );
+
+  // 4b) 靜態資源走 Network-First，成功後寫入快取；離線才退回快取
+  fetchResponder = async () => new Response('v2-fresh-js', { status: 200 });
+  const freshJs = dispatchFetch(new Request('https://ljwwei.github.io/cmoney/js/app.js'));
+  assert.ok(freshJs.responded);
+  const netRes = await freshJs.responded;
+  assert.equal(await netRes.text(), 'v2-fresh-js');
+  await Promise.all(freshJs.waits);
+
+  fetchResponder = async () => {
+    throw new Error('offline');
+  };
+  const offlineJs = dispatchFetch(new Request('https://ljwwei.github.io/cmoney/js/app.js'));
+  const cachedRes = await offlineJs.responded;
+  assert.equal(cachedRes.status, 200);
+  assert.equal(await cachedRes.text(), 'v2-fresh-js');
 });

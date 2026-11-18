@@ -49,11 +49,25 @@ body {
   margin: 0;
   min-height: 100vh;
   overflow-x: clip;
+  padding-top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
   font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--text);
   background: radial-gradient(1200px 600px at 10% -10%, var(--bg-2), var(--bg));
   background-attachment: fixed;
   line-height: 1.5;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: env(safe-area-inset-top);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(12px);
+  z-index: 11;
+  pointer-events: none;
 }
 
 /* ====== OLED 防烙印微幅像素位移（常駐背景運作，採整數實體像素對齊，避免桌面端 GPU 圖層與半像素造成模糊） ====== */
@@ -76,12 +90,11 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 /* ====== 頂部列 ====== */
 .topbar {
   position: sticky;
-  top: 0;
+  top: env(safe-area-inset-top);
   z-index: 10;
   backdrop-filter: blur(12px);
   background: color-mix(in srgb, var(--bg) 80%, transparent);
   border-bottom: 1px solid var(--card-border);
-  padding-top: env(safe-area-inset-top);
 }
 .topbar__inner {
   max-width: 1120px;
@@ -301,7 +314,7 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 .fut__num, .margin__num { font-size: 3rem; font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; }
 .margin__num { color: var(--text); }
 
-.site-foot { max-width: 1120px; margin: 0 auto; padding: 8px 24px calc(32px + env(safe-area-inset-bottom)); color: var(--muted); font-size: 0.8rem; }
+.site-foot { max-width: 1120px; margin: 0 auto; padding: 8px 24px 32px; color: var(--muted); font-size: 0.8rem; }
 .site-foot p { margin: 4px 0; }
 .site-foot .visit-counter { margin-top: 8px; font-variant-numeric: tabular-nums; }
 .site-foot .visit-counter strong { color: var(--text); font-weight: 700; }
@@ -373,6 +386,6 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
   .fut, .margin { gap: 10px; }
   .chip { padding: 3px 10px; font-size: 0.9rem; }
   .card__foot { font-size: 0.72rem; }
-  .site-foot { padding: 4px 16px calc(24px + env(safe-area-inset-bottom)); }
+  .site-foot { padding: 4px 16px 24px; }
 }
 

@@ -1,0 +1,32 @@
+{
+  "name": "台股盤中即時看板",
+  "short_name": "台股即時",
+  "description": "台股大盤盤中即時指數與每日盤後資訊：富果即時 WebSocket 大盤（含開盤/最高/最低）、三大法人買賣超、外資台股期貨空單、融資餘額。",
+  "lang": "zh-Hant",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
