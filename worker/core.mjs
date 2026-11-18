@@ -939,10 +939,10 @@ export const CWA_OBS_AUTO_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datasto
 export const CWA_OBS_SYNOPTIC_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001';
 export const MOENV_AQI_URL = 'https://data.moenv.gov.tw/api/v2/aqx_p_432';
 export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站
-export const CWA_TAINAN_FALLBACK_ID = '467410'; // 臺南氣象站（北區缺值時備援）
+export const CWA_TAINAN_FALLBACK_ID = '467410'; // 臺南氣象站（北區無 10 分鐘回傳時備援）
 export const MOENV_TAINAN_SITE = '臺南';
-export const WEATHER_CACHE_TTL_SEC = 300;
-const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v1';
+export const WEATHER_CACHE_TTL_SEC = 120; // 2 分鐘邊緣快取，確保即時反映氣象署每 10 分鐘觀測
+const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v2';
 
 export function computeAqiStatus(aqi) {
   if (aqi <= 50) return '良好';
@@ -1017,21 +1017,30 @@ export async function fetchWeatherReport(
 
   const fetchTemp = async () => {
     if (!cwaKey) return null;
-    const primaryUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
+    // 優先使用 O-A0003-001（10 分鐘綜觀氣象資料），比照民德市政府每 10 分鐘更新一次
+    const tenMinPrimaryUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
     try {
-      const json = await fetchJsonWithTimeout(fetchImpl, primaryUrl, 5000);
+      const json = await fetchJsonWithTimeout(fetchImpl, tenMinPrimaryUrl, 5000);
       const parsed = parseCwaTemperature(json, stationId);
       if (parsed) return parsed;
     } catch {}
-    // 若北區自動站短暫維護或無回傳，且目前查預設北區站時，退回 467410 臺南氣象站備援
+    // 若預設北區站 C0X100 未出現在 10 分鐘資料集或維護，優先退回同為 10 分鐘的 467410 臺南氣象站
     if (stationId === CWA_NORTH_STATION_ID) {
       try {
-        const fbUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${CWA_TAINAN_FALLBACK_ID}&format=JSON`;
-        const json = await fetchJsonWithTimeout(fetchImpl, fbUrl, 5000);
-        return parseCwaTemperature(json, CWA_TAINAN_FALLBACK_ID);
+        const tenMinTainanUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${CWA_TAINAN_FALLBACK_ID}&format=JSON`;
+        const json = await fetchJsonWithTimeout(fetchImpl, tenMinTainanUrl, 5000);
+        const parsed = parseCwaTemperature(json, CWA_TAINAN_FALLBACK_ID);
+        if (parsed) return parsed;
       } catch {}
     }
-    return null;
+    // 最後備援：O-A0001-001 逐時資料
+    try {
+      const hourlyUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
+      const json = await fetchJsonWithTimeout(fetchImpl, hourlyUrl, 5000);
+      return parseCwaTemperature(json, stationId);
+    } catch {
+      return null;
+    }
   };
 
   const fetchAqi = async () => {

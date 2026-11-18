@@ -616,7 +616,7 @@ export async function initVisitCounter({
 /* ========================================================
    臺南市北區氣溫 & 臺南測站 AQI（同民德市政府官網規格）
    ======================================================== */
-export const WEATHER_REFRESH_MS = 5 * 60 * 1000;
+export const WEATHER_REFRESH_MS = 60 * 1000;
 
 export function formatWeatherTime(raw, hasOffset, nowMs = Date.now()) {
   if (!raw) return '';

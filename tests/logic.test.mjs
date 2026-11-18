@@ -949,9 +949,8 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
   const mockFetch = async (url) => {
     upstreamCalls += 1;
     const u = String(url);
-    if (u.includes('O-A0001-001')) {
+    if (u.includes('O-A0003-001') && u.includes('StationId=C0X100')) {
       assert.ok(u.includes('Authorization=cwa-secret'));
-      assert.ok(u.includes('StationId=C0X100'));
       if (primaryBroken) return new Response(JSON.stringify({ records: { Station: [] } }), { status: 200 });
       return new Response(
         JSON.stringify({
@@ -960,7 +959,7 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
               {
                 StationId: 'C0X100',
                 StationName: '臺南市北區',
-                ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+                ObsTime: { DateTime: '2026-11-18T15:30:00+08:00' },
                 WeatherElement: { AirTemperature: '26.4' },
               },
             ],
@@ -969,8 +968,7 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
         { status: 200 },
       );
     }
-    if (u.includes('O-A0003-001')) {
-      assert.ok(u.includes('StationId=467410'));
+    if (u.includes('O-A0003-001') && u.includes('StationId=467410')) {
       return new Response(
         JSON.stringify({
           records: {
@@ -978,7 +976,7 @@ test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站
               {
                 StationId: '467410',
                 StationName: '臺南',
-                ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+                ObsTime: { DateTime: '2026-11-18T15:30:00+08:00' },
                 WeatherElement: { AirTemperature: '26.0' },
               },
             ],
@@ -1109,7 +1107,7 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   assert.equal(timeEl.textContent, '(14:50)');
   assert.equal(aqiEl.textContent, '空氣品質：普通 AQI 78 (14:00)');
   assert.equal(aqiEl.attrs.get('data-aqi-level'), '1');
-  assert.equal(intervalRegistered, 5 * 60 * 1000);
+  assert.equal(intervalRegistered, 60 * 1000);
 });
 
 test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑循環位移且卸載時 clearInterval', () => {
