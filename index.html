@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b1220" />
   <title>台股資訊 | 加權指數・三大法人・外資期貨・融資餘額</title>
   <meta name="description" content="台股大盤盤中即時指數與每日盤後資訊：富果即時 WebSocket 大盤（含開盤/最高/最低）、三大法人買賣超、外資台股期貨未平倉、融資餘額。" />
-  <!-- Cloudflare Worker 網址（後端統一維持單一富果 WebSocket 與 D1/SQLite 人數計次；金鑰 FUGLE_API_KEY 僅存於 Worker Secret） -->
+  <!-- Cloudflare Worker 網址（富果 WS 單例、D1/SQLite 人數計次、中央氣象署/環境部氣象空品代理；金鑰皆存於 Worker Secrets） -->
   <meta name="taiex-api" content="https://cmoney-taiex.gamerwillywilly.workers.dev" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b1220'/%3E%3Cpath d='M10 44 24 28l9 9 21-21' fill='none' stroke='%23ff5a5f' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="css/style.css" />
@@ -14,7 +14,24 @@
 <body>
   <header class="topbar">
     <div class="topbar__inner">
-      <h1 class="brand"><span class="brand__logo" aria-hidden="true">📈</span>台股資訊</h1>
+      <div class="topbar__left">
+        <h1 class="brand"><span class="brand__logo" aria-hidden="true">📈</span>台股資訊</h1>
+        <div class="env-info" aria-label="臺南市北區即時氣溫與臺南測站空氣品質">
+          <svg class="env-info__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="12" cy="12" r="5"></circle>
+            <line x1="12" y1="1" x2="12" y2="3"></line>
+            <line x1="12" y1="21" x2="12" y2="23"></line>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+            <line x1="1" y1="12" x2="3" y2="12"></line>
+            <line x1="21" y1="12" x2="23" y2="12"></line>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+          </svg>
+          <span class="env-info__temp">臺南市北區 <span data-live-temp>--</span>°C <span class="weather-time" data-live-temp-time></span></span>
+          <span class="weather-badge" data-live-aqi>空氣品質 載入中</span>
+        </div>
+      </div>
       <div class="clock" aria-live="off">
         <span class="clock__label">台北時間</span>
         <span class="clock__time" id="clock">--:--:--</span>

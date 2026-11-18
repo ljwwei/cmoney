@@ -26,6 +26,10 @@ import {
   indexBadge,
   createLiveStreamController,
   initVisitCounter,
+  formatWeatherTime,
+  aqiStatus,
+  aqiLevel,
+  initLiveWeather,
   FALLBACK_POLL_MS,
 } from '../js/app.js';
 import {
@@ -36,12 +40,16 @@ import {
   WS_RECOVERY_INTERVAL_MS,
   WS_COOLDOWN_1013_MS,
   IDLE_RELEASE_MS,
+  CWA_NORTH_STATION_ID,
   normalizeEpochMs,
   withYahooCacheBuster,
   shouldAcceptQuote,
   parseFugleSnapshot,
   parseFugleWsTick,
   parseYahooBackup,
+  parseCwaTemperature,
+  parseMoenvAqi,
+  handleWeatherRequest,
   FugleHubEngine,
   handleWorkerRequest,
 } from '../worker/core.mjs';
@@ -848,5 +856,254 @@ test('無 FUGLE_API_KEY 時直接啟用 Yahoo 備援；D1 與 DO SQLite 人數�
   assert.equal(hJson.backup, 'yahoo');
   assert.equal(hJson.hasFugleKey, true);
   assert.equal(hJson.hasDurableHub, true);
+  assert.equal(hJson.hasCwaKey, false);
+  assert.equal(hJson.hasMoenvKey, false);
   assert.equal(JSON.stringify(hJson).includes('secret'), false);
+});
+
+// ========================================================
+// 4. 臺南市北區氣溫（C0X100）與臺南測站 AQI（Worker 代理 + 前端顯示）
+// ========================================================
+
+test('氣象署 CWA（臺南市北區 C0X100）與環境部 MOENV（臺南測站 AQI）解析及備援快取', async () => {
+  // 1. 同時支援 PascalCase 與 camelCase，並過濾 -99 / X 異常值
+  const pascalTemp = parseCwaTemperature({
+    records: {
+      Station: [
+        {
+          StationId: '467410',
+          StationName: '臺南',
+          ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+          WeatherElement: { AirTemperature: '26.1' },
+        },
+        {
+          StationId: CWA_NORTH_STATION_ID,
+          StationName: '臺南市北區',
+          ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+          WeatherElement: { AirTemperature: '26.8' },
+        },
+      ],
+    },
+  });
+  assert.deepEqual(pascalTemp, {
+    station: '臺南市北區',
+    stationId: 'C0X100',
+    temperature: 26.8,
+    tempObsTime: '2026-11-18T14:50:00+08:00',
+  });
+
+  const camelTemp = parseCwaTemperature({
+    records: {
+      station: [
+        {
+          stationId: 'C0X100',
+          stationName: '臺南市北區',
+          obsTime: { dateTime: '2026-11-18T15:00:00+08:00' },
+          weatherElement: { airTemperature: '27.3' },
+        },
+      ],
+    },
+  });
+  assert.equal(camelTemp.temperature, 27.3);
+
+  assert.equal(
+    parseCwaTemperature({
+      records: { Station: [{ StationId: 'C0X100', WeatherElement: { AirTemperature: '-99' } }] },
+    }),
+    null,
+  );
+  assert.equal(
+    parseCwaTemperature({
+      records: { Station: [{ StationId: 'C0X100', WeatherElement: { AirTemperature: 'X' } }] },
+    }),
+    null,
+  );
+
+  // 2. MOENV AQI 解析
+  assert.deepEqual(
+    parseMoenvAqi({
+      records: [{ sitename: '臺南', aqi: '68', status: '', publishtime: '2026/11/18 14:00:00' }],
+    }),
+    { aqiSite: '臺南', aqi: 68, aqiStatus: '普通', aqiPublishTime: '2026/11/18 14:00:00' },
+  );
+
+  // 3. handleWeatherRequest：主站 C0X100 正常、單飛去重、5 分鐘邊緣快取 + 跨來源動態 CORS
+  const cacheMap = new Map();
+  const mockCache = {
+    match: async (k) => {
+      const v = cacheMap.get(String(k));
+      return v ? v.clone() : undefined;
+    },
+    put: async (k, res) => {
+      cacheMap.set(String(k), res.clone());
+    },
+  };
+  const weatherState = { inFlight: null, lastGood: null };
+  let upstreamCalls = 0;
+  let primaryBroken = false;
+
+  const mockFetch = async (url) => {
+    upstreamCalls += 1;
+    const u = String(url);
+    if (u.includes('O-A0001-001')) {
+      assert.ok(u.includes('Authorization=cwa-secret'));
+      assert.ok(u.includes('StationId=C0X100'));
+      if (primaryBroken) return new Response(JSON.stringify({ records: { Station: [] } }), { status: 200 });
+      return new Response(
+        JSON.stringify({
+          records: {
+            Station: [
+              {
+                StationId: 'C0X100',
+                StationName: '臺南市北區',
+                ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+                WeatherElement: { AirTemperature: '26.4' },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (u.includes('O-A0003-001')) {
+      assert.ok(u.includes('StationId=467410'));
+      return new Response(
+        JSON.stringify({
+          records: {
+            Station: [
+              {
+                StationId: '467410',
+                StationName: '臺南',
+                ObsTime: { DateTime: '2026-11-18T14:50:00+08:00' },
+                WeatherElement: { AirTemperature: '26.0' },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (u.includes('aqx_p_432')) {
+      assert.ok(u.includes('api_key=moenv-secret'));
+      return new Response(
+        JSON.stringify({
+          records: [{ sitename: '臺南', aqi: '42', status: '良好', publishtime: '2026/11/18 14:00:00' }],
+        }),
+        { status: 200 },
+      );
+    }
+    throw new Error('Unexpected url: ' + u);
+  };
+
+  const envWeather = { CWA_API_KEY: 'cwa-secret', MOENV_API_KEY: 'moenv-secret' };
+  const [rA, rB] = await Promise.all([
+    handleWeatherRequest(
+      new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
+      envWeather,
+      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+    ),
+    handleWeatherRequest(
+      new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
+      envWeather,
+      { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+    ),
+  ]);
+  assert.equal(upstreamCalls, 2, 'concurrent hits share one CWA + one MOENV fetch');
+  const jA = await rA.json();
+  const jB = await rB.json();
+  assert.equal(jA.station, '臺南市北區');
+  assert.equal(jA.temperature, 26.4);
+  assert.equal(jA.aqi, 42);
+  assert.equal(jA.aqiStatus, '良好');
+  assert.equal(jB.aqi, 42);
+  assert.equal(JSON.stringify(jA).includes('secret'), false);
+
+  // 快取命中應支援不同允許網域的動態 CORS Header，且不再增加上游呼叫
+  const rLocal = await handleWeatherRequest(
+    new Request('https://w.example/api/weather', { headers: { Origin: 'http://localhost:8080' } }),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: weatherState },
+  );
+  assert.equal(rLocal.headers.get('Access-Control-Allow-Origin'), 'http://localhost:8080');
+  assert.equal(upstreamCalls, 2);
+
+  // 清除快取並模擬 C0X100 缺值 -> 自動退回 467410 臺南氣象站備援
+  cacheMap.clear();
+  primaryBroken = true;
+  const rFb = await handleWeatherRequest(
+    new Request('https://w.example/api/weather', { headers: { Origin: 'https://ljwwei.github.io' } }),
+    envWeather,
+    { fetchImpl: mockFetch, cacheStore: mockCache, state: { inFlight: null, lastGood: null } },
+  );
+  const jFb = await rFb.json();
+  assert.equal(jFb.stationId, '467410');
+  assert.equal(jFb.temperature, 26);
+});
+
+test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM 更新）', async () => {
+  const nowMs = tpe('2026-11-18T15:05:00').getTime();
+  assert.equal(formatWeatherTime('2026-11-18T14:50:00+08:00', true, nowMs), '14:50');
+  assert.equal(formatWeatherTime('2026/11/18 14:00:00', false, nowMs), '14:00');
+  assert.equal(formatWeatherTime('2026/11/17 23:00:00', false, nowMs), '11/17 23:00');
+
+  assert.equal(aqiStatus(33), '良好');
+  assert.equal(aqiStatus(78), '普通');
+  assert.equal(aqiStatus(120), '對敏感族群不健康');
+  assert.equal(aqiLevel(33), 0);
+  assert.equal(aqiLevel(78), 1);
+  assert.equal(aqiLevel(120), 2);
+  assert.equal(aqiLevel(220), 4);
+
+  const makeEl = () => ({
+    textContent: '',
+    attrs: new Map(),
+    setAttribute(k, v) {
+      this.attrs.set(k, v);
+    },
+  });
+  const tempEl = makeEl();
+  const timeEl = makeEl();
+  const aqiEl = makeEl();
+  let intervalRegistered = null;
+
+  const ctl = initLiveWeather({
+    apiOrigin: 'https://cmoney-taiex.example.workers.dev',
+    nowFn: () => nowMs,
+    setIntervalFn: (_fn, ms) => {
+      intervalRegistered = ms;
+      return 1;
+    },
+    documentRef: {
+      querySelectorAll(sel) {
+        if (sel === '[data-live-temp]') return [tempEl];
+        if (sel === '[data-live-temp-time]') return [timeEl];
+        if (sel === '[data-live-aqi]') return [aqiEl];
+        return [];
+      },
+    },
+    fetchImpl: async (url, init) => {
+      assert.equal(url, `https://cmoney-taiex.example.workers.dev/api/weather?_t=${nowMs}`);
+      assert.equal(init.cache, 'no-store');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          station: '臺南市北區',
+          temperature: 26.8,
+          tempObsTime: '2026-11-18T14:50:00+08:00',
+          aqiSite: '臺南',
+          aqi: 78,
+          aqiStatus: '普通',
+          aqiPublishTime: '2026/11/18 14:00:00',
+        }),
+        { status: 200 },
+      );
+    },
+  });
+
+  await ctl.initialPromise;
+  assert.equal(tempEl.textContent, '26.8');
+  assert.equal(timeEl.textContent, '(14:50)');
+  assert.equal(aqiEl.textContent, '空氣品質：普通 AQI 78 (14:00)');
+  assert.equal(aqiEl.attrs.get('data-aqi-level'), '1');
+  assert.equal(intervalRegistered, 5 * 60 * 1000);
 });

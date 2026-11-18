@@ -71,16 +71,77 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 .topbar__inner {
   max-width: 1120px;
   margin: 0 auto;
-  padding: 14px 24px;
+  padding: 12px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px 18px;
+  flex-wrap: wrap;
 }
-.brand { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; display: flex; align-items: center; gap: 10px; }
+.topbar__left {
+  display: flex;
+  align-items: center;
+  gap: 6px 16px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.brand { margin: 0; font-size: 1.35rem; letter-spacing: 0.04em; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .brand__logo { font-size: 1.4rem; }
-.clock { display: flex; align-items: baseline; gap: 10px; font-variant-numeric: tabular-nums; }
+.clock { display: flex; align-items: baseline; gap: 10px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .clock__label { color: var(--muted); font-size: 0.8rem; }
 .clock__time { font-size: 1.15rem; font-weight: 600; }
+
+/* ====== 頂部氣溫與 AQI（與民德市政府官網相同格式與等級著色） ====== */
+.env-info {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 0.84rem;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.env-info__icon {
+  width: 15px;
+  height: 15px;
+  stroke: #38bdf8;
+  flex-shrink: 0;
+}
+.env-info__temp { white-space: nowrap; }
+.weather-time {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.weather-badge {
+  display: inline-block;
+  width: fit-content;
+  white-space: nowrap;
+  flex-shrink: 0;
+  line-height: 1.4;
+  background: rgba(2, 132, 199, 0.2);
+  color: #7dd3fc;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid rgba(125, 211, 252, 0.3);
+}
+.weather-badge[data-aqi-level="0"] { color: #00e400; border-color: rgba(0, 228, 0, 0.45); }
+.weather-badge[data-aqi-level="1"] { color: #ffff00; border-color: rgba(255, 255, 0, 0.45); }
+.weather-badge[data-aqi-level="2"] { color: #ff7e00; border-color: rgba(255, 126, 0, 0.5); }
+.weather-badge[data-aqi-level="3"] { color: #ff0000; border-color: rgba(255, 0, 0, 0.5); }
+.weather-badge[data-aqi-level="4"] { color: #8f3f97; border-color: #8f3f97; background: #f1f5f9; font-weight: 700; }
+.weather-badge[data-aqi-level="5"] { color: #7e0023; border-color: #7e0023; background: #f1f5f9; font-weight: 700; }
+
+@media (prefers-color-scheme: light) {
+  .env-info__icon { stroke: #0284c7; }
+  .weather-badge { color: #0369a1; background: rgba(2, 132, 199, 0.12); border-color: rgba(2, 132, 199, 0.35); }
+  .weather-badge[data-aqi-level="0"] { color: #15803d; background: rgba(21, 128, 61, 0.12); border-color: rgba(21, 128, 61, 0.35); }
+  .weather-badge[data-aqi-level="1"] { color: #a16207; background: rgba(234, 179, 8, 0.16); border-color: rgba(202, 138, 4, 0.45); }
+  .weather-badge[data-aqi-level="2"] { color: #c2410c; background: rgba(234, 88, 12, 0.14); border-color: rgba(234, 88, 12, 0.45); }
+  .weather-badge[data-aqi-level="3"] { color: #dc2626; background: rgba(220, 38, 38, 0.12); border-color: rgba(220, 38, 38, 0.45); }
+}
 
 /* ====== 卡片 ====== */
 .grid { max-width: 1120px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
@@ -258,8 +319,11 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 
 /* ====== 手機版（< 600px）：單欄、緊湊、大字、易點閱 ====== */
 @media (max-width: 599.98px) {
-  .topbar__inner { padding: 10px 16px; }
+  .topbar__inner { padding: 10px 16px; gap: 6px 12px; }
+  .topbar__left { gap: 4px 10px; }
   .brand { font-size: 1.1rem; }
+  .env-info { font-size: 0.78rem; gap: 4px 6px; }
+  .weather-badge { font-size: 0.72rem; padding: 1px 8px; }
   .clock__label { display: none; }
   .clock__time { font-size: 1rem; }
 

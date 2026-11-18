@@ -613,6 +613,130 @@ export async function initVisitCounter({
   return null;
 }
 
+/* ========================================================
+   臺南市北區氣溫 & 臺南測站 AQI（同民德市政府官網規格）
+   ======================================================== */
+export const WEATHER_REFRESH_MS = 5 * 60 * 1000;
+
+export function formatWeatherTime(raw, hasOffset, nowMs = Date.now()) {
+  if (!raw) return '';
+  let y;
+  let mo;
+  let da;
+  let hh;
+  let mi;
+  if (hasOffset) {
+    const dt = new Date(raw);
+    if (Number.isNaN(dt.getTime())) return '';
+    const tw = new Date(dt.getTime() + 8 * 3600 * 1000);
+    [y, mo, da, hh, mi] = [
+      tw.getUTCFullYear(),
+      tw.getUTCMonth() + 1,
+      tw.getUTCDate(),
+      tw.getUTCHours(),
+      tw.getUTCMinutes(),
+    ];
+  } else {
+    const m = String(raw).match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})[ T](\d{1,2}):(\d{2})/);
+    if (!m) return '';
+    [y, mo, da, hh, mi] = m.slice(1).map(Number);
+  }
+  const p = (n) => String(n).padStart(2, '0');
+  const now = new Date(nowMs + 8 * 3600 * 1000);
+  const isToday = y === now.getUTCFullYear() && mo === now.getUTCMonth() + 1 && da === now.getUTCDate();
+  return `${isToday ? '' : `${mo}/${da} `}${p(hh)}:${p(mi)}`;
+}
+
+export function aqiStatus(aqi) {
+  if (aqi <= 50) return '良好';
+  if (aqi <= 100) return '普通';
+  if (aqi <= 150) return '對敏感族群不健康';
+  if (aqi <= 200) return '對所有族群不健康';
+  if (aqi <= 300) return '非常不健康';
+  return '危害';
+}
+
+export function aqiLevel(aqi) {
+  if (aqi <= 50) return 0;
+  if (aqi <= 100) return 1;
+  if (aqi <= 150) return 2;
+  if (aqi <= 200) return 3;
+  if (aqi <= 300) return 4;
+  return 5;
+}
+
+export function initLiveWeather({
+  apiOrigin = resolveApiOrigin(),
+  fetchImpl = typeof globalThis !== 'undefined' && globalThis.fetch ? globalThis.fetch.bind(globalThis) : null,
+  documentRef = typeof document !== 'undefined' ? document : null,
+  nowFn = () => Date.now(),
+  setIntervalFn = setInterval,
+  refreshMs = WEATHER_REFRESH_MS,
+} = {}) {
+  const tempEls = documentRef?.querySelectorAll?.('[data-live-temp]') ?? [];
+  const tempTimeEls = documentRef?.querySelectorAll?.('[data-live-temp-time]') ?? [];
+  const aqiEls = documentRef?.querySelectorAll?.('[data-live-aqi]') ?? [];
+  if ((!tempEls.length && !aqiEls.length) || !apiOrigin || !fetchImpl) return null;
+
+  let lastFetchedAt = 0;
+
+  function setTemp(text, timeText) {
+    tempEls.forEach((el) => {
+      el.textContent = text;
+    });
+    tempTimeEls.forEach((el) => {
+      el.textContent = timeText ? `(${timeText})` : '';
+    });
+  }
+
+  function setAqi(text, level) {
+    aqiEls.forEach((el) => {
+      el.textContent = text;
+      el.setAttribute('data-aqi-level', level ?? '');
+    });
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetchImpl(`${apiOrigin}/api/weather?_t=${nowFn()}`, {
+        cache: 'no-store',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = await res.json();
+      lastFetchedAt = nowFn();
+
+      const t = parseFloat(d?.temperature);
+      setTemp(Number.isNaN(t) ? '--' : t.toFixed(1), Number.isNaN(t) ? '' : formatWeatherTime(d.tempObsTime, true, nowFn()));
+
+      const aqi = parseInt(d?.aqi, 10);
+      if (Number.isNaN(aqi)) {
+        setAqi('空氣品質 --', '');
+      } else {
+        const status = d.aqiStatus || aqiStatus(aqi);
+        const aqiTime = formatWeatherTime(d.aqiPublishTime, false, nowFn());
+        setAqi(`空氣品質：${status} AQI ${aqi}${aqiTime ? ` (${aqiTime})` : ''}`, String(aqiLevel(aqi)));
+      }
+      return d;
+    } catch (err) {
+      console.warn('讀取氣象/空品失敗', err?.message ?? err);
+      setTemp('--', '');
+      setAqi('空氣品質 --', '');
+      return null;
+    }
+  }
+
+  const initialPromise = refresh();
+  setIntervalFn(refresh, refreshMs);
+
+  return {
+    refresh,
+    onVisibilityShow() {
+      if (nowFn() - lastFetchedAt >= 60 * 1000) refresh();
+    },
+    initialPromise,
+  };
+}
+
 function githubApiUrl() {
   if (typeof location === 'undefined' || !location.hostname.endsWith('.github.io')) return null;
   const owner = location.hostname.split('.')[0];
@@ -687,6 +811,7 @@ async function load() {
 }
 
 let liveController = null;
+let weatherController = null;
 
 if (typeof document !== 'undefined') {
   const apiOrigin = resolveApiOrigin();
@@ -697,6 +822,7 @@ if (typeof document !== 'undefined') {
   });
 
   initVisitCounter({ apiOrigin });
+  weatherController = initLiveWeather({ apiOrigin });
   load();
   setInterval(load, 30 * 1000);
   setInterval(() => {
@@ -710,6 +836,7 @@ if (typeof document !== 'undefined') {
     } else {
       load();
       liveController.onVisibilityChange();
+      weatherController?.onVisibilityShow();
     }
   });
   window.addEventListener('pagehide', () => liveController.stop());

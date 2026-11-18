@@ -931,6 +931,216 @@ async function defaultCloudflareWsConnect(fetchImpl, url, signal) {
   return ws;
 }
 
+/* ========================================================
+   臺南市北區氣溫（中央氣象署）與臺南測站 AQI（環境部）
+   API Key 僅由 Cloudflare Worker Secrets 讀取，不暴露於前端
+   ======================================================== */
+export const CWA_OBS_AUTO_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001';
+export const CWA_OBS_SYNOPTIC_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001';
+export const MOENV_AQI_URL = 'https://data.moenv.gov.tw/api/v2/aqx_p_432';
+export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站
+export const CWA_TAINAN_FALLBACK_ID = '467410'; // 臺南氣象站（北區缺值時備援）
+export const MOENV_TAINAN_SITE = '臺南';
+export const WEATHER_CACHE_TTL_SEC = 300;
+const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v1';
+
+export function computeAqiStatus(aqi) {
+  if (aqi <= 50) return '良好';
+  if (aqi <= 100) return '普通';
+  if (aqi <= 150) return '對敏感族群不健康';
+  if (aqi <= 200) return '對所有族群不健康';
+  if (aqi <= 300) return '非常不健康';
+  return '危害';
+}
+
+export function parseCwaTemperature(json, preferredId = CWA_NORTH_STATION_ID) {
+  const rec = json?.records;
+  const list = rec?.Station || rec?.station;
+  if (!Array.isArray(list) || !list.length) return null;
+  const st = list.find((item) => (item?.StationId ?? item?.stationId) === preferredId) || list[0];
+  const we = st?.WeatherElement || st?.weatherElement;
+  const rawTemp = we?.AirTemperature ?? we?.airTemperature;
+  const temp = parseNum(rawTemp);
+  if (!Number.isFinite(temp) || temp <= -90 || temp > 65) return null;
+  const obs = st?.ObsTime || st?.obsTime;
+  const tempObsTime = String(obs?.DateTime ?? obs?.dateTime ?? '').trim();
+  const station = String(st?.StationName ?? st?.stationName ?? '臺南市北區').trim();
+  return {
+    station,
+    stationId: String(st?.StationId ?? st?.stationId ?? preferredId).trim(),
+    temperature: Math.round(temp * 10) / 10,
+    tempObsTime,
+  };
+}
+
+export function parseMoenvAqi(json, siteName = MOENV_TAINAN_SITE) {
+  const list = Array.isArray(json) ? json : json?.records;
+  if (!Array.isArray(list) || !list.length) return null;
+  const rec = list.find((r) => (r?.sitename ?? r?.SiteName) === siteName) || list[0];
+  const aqi = parseInt(rec?.aqi ?? rec?.AQI, 10);
+  if (!Number.isFinite(aqi) || aqi < 0 || aqi > 1000) return null;
+  const aqiStatus = String(rec?.status ?? rec?.Status ?? '').trim() || computeAqiStatus(aqi);
+  const aqiPublishTime = String(rec?.publishtime ?? rec?.PublishTime ?? '').trim();
+  const aqiSite = String(rec?.sitename ?? rec?.SiteName ?? siteName).trim();
+  return { aqiSite, aqi, aqiStatus, aqiPublishTime };
+}
+
+async function fetchJsonWithTimeout(fetchImpl, url, timeoutMs = 5000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(url, {
+      headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const defaultWeatherState = { inFlight: null, lastGood: null };
+
+export async function fetchWeatherReport(
+  env,
+  { fetchImpl = globalThis.fetch.bind(globalThis), state = defaultWeatherState } = {},
+) {
+  const cwaKey = String(env?.CWA_API_KEY || '').trim();
+  const moenvKey = String(env?.MOENV_API_KEY || '').trim();
+  const stationId = String(env?.CWA_STATION_ID || CWA_NORTH_STATION_ID).trim() || CWA_NORTH_STATION_ID;
+  const siteName = String(env?.MOENV_SITE_NAME || MOENV_TAINAN_SITE).trim() || MOENV_TAINAN_SITE;
+
+  const missingKeys = [];
+  if (!cwaKey) missingKeys.push('CWA_API_KEY');
+  if (!moenvKey) missingKeys.push('MOENV_API_KEY');
+
+  const fetchTemp = async () => {
+    if (!cwaKey) return null;
+    const primaryUrl = `${CWA_OBS_AUTO_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${encodeURIComponent(stationId)}&format=JSON`;
+    try {
+      const json = await fetchJsonWithTimeout(fetchImpl, primaryUrl, 5000);
+      const parsed = parseCwaTemperature(json, stationId);
+      if (parsed) return parsed;
+    } catch {}
+    // 若北區自動站短暫維護或無回傳，且目前查預設北區站時，退回 467410 臺南氣象站備援
+    if (stationId === CWA_NORTH_STATION_ID) {
+      try {
+        const fbUrl = `${CWA_OBS_SYNOPTIC_URL}?Authorization=${encodeURIComponent(cwaKey)}&StationId=${CWA_TAINAN_FALLBACK_ID}&format=JSON`;
+        const json = await fetchJsonWithTimeout(fetchImpl, fbUrl, 5000);
+        return parseCwaTemperature(json, CWA_TAINAN_FALLBACK_ID);
+      } catch {}
+    }
+    return null;
+  };
+
+  const fetchAqi = async () => {
+    if (!moenvKey) return null;
+    try {
+      const url = `${MOENV_AQI_URL}?api_key=${encodeURIComponent(moenvKey)}&limit=10&format=json&filters=${encodeURIComponent(`sitename,EQ,${siteName}`)}`;
+      const json = await fetchJsonWithTimeout(fetchImpl, url, 5000);
+      return parseMoenvAqi(json, siteName);
+    } catch {
+      return null;
+    }
+  };
+
+  const [tempRes, aqiRes] = await Promise.allSettled([fetchTemp(), fetchAqi()]);
+  const tempData = tempRes.status === 'fulfilled' ? tempRes.value : null;
+  const aqiData = aqiRes.status === 'fulfilled' ? aqiRes.value : null;
+
+  const prev =
+    state?.lastGood && state.lastGood.requestedStation === stationId && state.lastGood.requestedSite === siteName
+      ? state.lastGood.payload
+      : null;
+
+  const payload = {
+    ok: Boolean(tempData || aqiData || prev),
+    station: tempData?.station ?? prev?.station ?? '臺南市北區',
+    stationId: tempData?.stationId ?? prev?.stationId ?? stationId,
+    temperature: tempData ? tempData.temperature : prev?.temperature ?? null,
+    tempObsTime: tempData ? tempData.tempObsTime : prev?.tempObsTime ?? '',
+    aqiSite: aqiData?.aqiSite ?? prev?.aqiSite ?? siteName,
+    aqi: aqiData ? aqiData.aqi : prev?.aqi ?? null,
+    aqiStatus: aqiData ? aqiData.aqiStatus : prev?.aqiStatus ?? '',
+    aqiPublishTime: aqiData ? aqiData.aqiPublishTime : prev?.aqiPublishTime ?? '',
+    missingKeys,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (state && (tempData || aqiData)) {
+    state.lastGood = { requestedStation: stationId, requestedSite: siteName, payload };
+  }
+  return payload;
+}
+
+export async function handleWeatherRequest(
+  request,
+  env,
+  {
+    fetchImpl = globalThis.fetch.bind(globalThis),
+    cacheStore = typeof caches !== 'undefined' ? caches.default : null,
+    state = defaultWeatherState,
+  } = {},
+) {
+  const canUseEdgeCache = Boolean(cacheStore && env?.CWA_API_KEY && env?.MOENV_API_KEY);
+
+  if (canUseEdgeCache) {
+    try {
+      const hit = await cacheStore.match(WEATHER_EDGE_CACHE_KEY);
+      if (hit) {
+        const body = await hit.text();
+        return new Response(body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`,
+            ...buildCorsHeaders(request, env),
+          },
+        });
+      }
+    } catch {}
+  }
+
+  let task = state?.inFlight;
+  if (!task) {
+    task = fetchWeatherReport(env, { fetchImpl, state }).finally(() => {
+      if (state) state.inFlight = null;
+    });
+    if (state) state.inFlight = task;
+  }
+  const payload = await task;
+  const jsonText = JSON.stringify(payload);
+  const hasAnyData = payload.temperature != null || payload.aqi != null;
+
+  if (canUseEdgeCache && hasAnyData && payload.missingKeys.length === 0) {
+    try {
+      await cacheStore.put(
+        WEATHER_EDGE_CACHE_KEY,
+        new Response(jsonText, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`,
+          },
+        }),
+      );
+    } catch {}
+  }
+
+  return new Response(jsonText, {
+    status: hasAnyData || payload.missingKeys.length > 0 ? 200 : 502,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control':
+        hasAnyData && payload.missingKeys.length === 0
+          ? `public, max-age=60, s-maxage=${WEATHER_CACHE_TTL_SEC}`
+          : 'no-store, no-cache, must-revalidate',
+      ...buildCorsHeaders(request, env),
+    },
+  });
+}
+
 /** 公開路由分派（支援 Durable Object 單例或無 DO 綁定時的安全降級） */
 export async function handleWorkerRequest(request, env, fallbackHubFactory) {
   if (request.method === 'OPTIONS') {
@@ -963,6 +1173,10 @@ export async function handleWorkerRequest(request, env, fallbackHubFactory) {
     return jsonResponse({ ok: false, error: 'Method Not Allowed' }, 405, request, env);
   }
 
+  if (url.pathname === '/api/weather' || url.pathname === '/api/env') {
+    return handleWeatherRequest(request, env);
+  }
+
   if (url.pathname === '/health') {
     let hubStatus = null;
     if (env?.FUGLE_HUB) {
@@ -977,6 +1191,8 @@ export async function handleWorkerRequest(request, env, fallbackHubFactory) {
         primary: 'fugle',
         backup: 'yahoo',
         hasFugleKey: Boolean(env?.FUGLE_API_KEY),
+        hasCwaKey: Boolean(env?.CWA_API_KEY),
+        hasMoenvKey: Boolean(env?.MOENV_API_KEY),
         hasDurableHub: Boolean(env?.FUGLE_HUB),
         hasD1: Boolean(env?.DB),
         taipeiTime: taipeiNowParts(),

@@ -8,6 +8,7 @@
 | 三大法人買賣超 | 證交所 `BFI82U` | 外資、投信、自營商（自行買賣＋避險）買賣超金額（億）。買超紅、賣超綠。標註「不含鉅額 / 含鉅額」 |
 | 外資台股期貨未平倉 | 期交所「三大法人-區分各期貨契約」CSV | 外資及陸資・臺股期貨・未平倉多空淨額，取絕對值顯示口數（−103473 → 103,473 口 淨空單） |
 | 融資餘額 | 證交所 `MI_MARGN` | 融資金額今日餘額（仟元）→ 億（四捨五入），並與「前日餘額」比較顯示增減（億，1 位小數） |
+| 臺南市北區氣溫／AQI | 中央氣象署 `O-A0001-001`（`C0X100` 臺南市北區，備援 `467410`）＋ 環境部 `aqx_p_432`（`臺南`） | 由 Worker `/api/weather` 代理並快取 5 分鐘（`CWA_API_KEY`、`MOENV_API_KEY` 僅存於 Secret）；顯示於頂部標題右側，含觀察時間與分級色標 |
 | 累積瀏覽總人次 | Cloudflare D1 (`DB`)／`FugleHub` 內建 SQLite (`site_counters`) | 載入首頁時呼叫 `POST /api/stats/visits`，與民德市政府官網同規格累加顯示於頁尾 |
 
 ## 抓取時間（台北時間，非交易日一律不抓）
@@ -58,6 +59,8 @@ tests/logic.test.mjs                   單元測試（node --test tests/）
 1. **設定環境變數 Secret**（切勿寫死於程式碼或送進 Git）：
    ```bash
    npx wrangler secret put FUGLE_API_KEY
+   npx wrangler secret put CWA_API_KEY
+   npx wrangler secret put MOENV_API_KEY
    ```
    （本機開發可複製 `.env.example` 為 `.dev.vars`；若為正式公開網站，請於富果後台限制 API Key 網域或白名單）
 2. **部署 Worker**（需讓 `wrangler.jsonc` 中的 Durable Object migration 生效，請勿只用控制台貼上單檔）：
