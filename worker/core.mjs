@@ -942,8 +942,8 @@ export const CWA_TAINAN_STATION_ID = '467410'; // 臺南氣象站（每 10 分�
 export const CWA_NORTH_STATION_ID = 'C0X100'; // 臺南市北區自動氣象站（備援）
 export const CWA_TAINAN_FALLBACK_ID = '467410';
 export const MOENV_TAINAN_SITE = '臺南';
-export const WEATHER_CACHE_TTL_SEC = 120; // 2 分鐘邊緣快取，確保即時反映氣象署每 10 分鐘觀測
-const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v2';
+export const WEATHER_CACHE_TTL_SEC = 180; // 3 分鐘邊緣快取，對齊雙站每 3 分鐘更新一次
+const WEATHER_EDGE_CACHE_KEY = 'https://cache.cmoney.local/api/weather-v3';
 
 export function computeAqiStatus(aqi) {
   if (aqi <= 50) return '良好';

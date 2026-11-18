@@ -45,6 +45,7 @@ import {
   WS_COOLDOWN_1013_MS,
   IDLE_RELEASE_MS,
   CWA_NORTH_STATION_ID,
+  WEATHER_CACHE_TTL_SEC,
   normalizeEpochMs,
   withYahooCacheBuster,
   shouldAcceptQuote,
@@ -1114,9 +1115,10 @@ test('前端頂部氣象/空品元件（formatWeatherTime、AQI 等級與 DOM �
   await ctl.initialPromise;
   assert.equal(tempEl.textContent, '26.8');
   assert.equal(timeEl.textContent, '(14:50)');
+  assert.equal(WEATHER_CACHE_TTL_SEC, 180);
   assert.equal(aqiEl.textContent, '空氣品質：普通 AQI 78 (14:00)');
   assert.equal(aqiEl.attrs.get('data-aqi-level'), '1');
-  assert.equal(intervalRegistered, 60 * 1000);
+  assert.equal(intervalRegistered, 3 * 60 * 1000);
 });
 
 test('OLED 防烙印微幅位移（initPixelShift）：每 60 秒依 8 點路徑循環位移且卸載時 clearInterval', () => {
