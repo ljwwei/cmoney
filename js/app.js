@@ -90,9 +90,9 @@ export function isPending(dataDate, today, closedDates) {
   return isTradingDay(today, closedDates) && (!dataDate || dataDate < today);
 }
 
-/** 台北時間交易日 08:55:00 ～ 13:35:00：啟用大盤盤中即時串流 */
+/** 台北時間交易日 08:55:00 ～ 13:45:00（銜接至證交所盤後正式資料入帳即自動停用） */
 export function inIntradayWindow(dateStr, timeStr, closedDates = []) {
-  return isTradingDay(dateStr, closedDates) && timeStr >= '08:55:00' && timeStr <= '13:35:00';
+  return isTradingDay(dateStr, closedDates) && timeStr >= '08:55:00' && timeStr <= '13:45:00';
 }
 
 /** 取得報價實際成交 Unix Timestamp（毫秒） */
@@ -130,6 +130,14 @@ export function acceptLiveQuote(current, incoming, latestQuoteTimestamp = 0) {
  */
 export function selectIndexDisplay(stateIndex, liveIndex, today) {
   if (stateIndex?.date === today && (stateIndex.source === 'twse' || stateIndex.source === 'openapi')) {
+    if (liveIndex?.date === today && (!(stateIndex.open > 0) || !(stateIndex.high > 0) || !(stateIndex.low > 0))) {
+      return {
+        ...stateIndex,
+        open: stateIndex.open > 0 ? stateIndex.open : liveIndex.open,
+        high: stateIndex.high > 0 ? stateIndex.high : liveIndex.high,
+        low: stateIndex.low > 0 ? stateIndex.low : liveIndex.low,
+      };
+    }
     return stateIndex;
   }
   if (liveIndex?.date === today) {
@@ -432,14 +440,37 @@ export function renderIndex(d) {
     <p class="sub">較前一交易日收盤</p>`;
 }
 
-/** 畫面資料源標籤僅保留兩種即時狀態：富果盤中即時 與 Yahoo 盤中即時 (備援) */
-export function indexBadge(d, today) {
+/**
+ * 判斷大盤卡片階段：
+ *  - 'settled'  ：收到 13:30 後第一筆證交所盤後正式資料（twse / openapi）→「已收盤」（約 13:34～13:36）
+ *  - 'closing'  ：13:30:00 後仍顯示即時資料（尚未入帳盤後正式資料）→「即時終盤」
+ *  - 'intraday' ：盤中 13:30 前跳動中 →「盤中即時」（若觸發備援則顯示「盤中即時 (備援)」）
+ *  - ''         ：非今日資料（前一交易日）
+ */
+export function getIndexPhase(d, today, time = '') {
   if (!d || d.date !== today) return '';
-  if (d.source === 'fugle') {
-    return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>富果盤中即時</span>';
+  if (d.source === 'twse' || d.source === 'openapi') return 'settled';
+  if (d.source === 'fugle' || d.source === 'yahoo') {
+    const isClosing = (time && time >= '13:30:00') || d.marketPhase === 'closed' || (d.time && d.time >= '13:30:00');
+    return isClosing ? 'closing' : 'intraday';
   }
-  if (d.source === 'yahoo') {
-    return '<span class="badge badge--backup">Yahoo 盤中即時 (備援)</span>';
+  return '';
+}
+
+/** 畫面大盤狀態標籤：盤中即時 → 13:30 即時終盤 → 收到盤後新資料後 已收盤 */
+export function indexBadge(d, today, time = '') {
+  const phase = getIndexPhase(d, today, time);
+  if (phase === 'settled') {
+    return '<span class="badge badge--closed">已收盤</span>';
+  }
+  if (phase === 'closing') {
+    return '<span class="badge badge--closing">即時終盤</span>';
+  }
+  if (phase === 'intraday') {
+    if (d.source === 'yahoo') {
+      return '<span class="badge badge--backup">盤中即時 (備援)</span>';
+    }
+    return '<span class="badge badge--live"><i class="live-dot" aria-hidden="true"></i>盤中即時</span>';
   }
   return '';
 }
@@ -538,13 +569,13 @@ const CARDS = [
   { id: 'card-margin', key: 'margin', render: renderMargin },
 ];
 
-function renderCard(card, state, today, liveIndex) {
+function renderCard(card, state, today, time, liveIndex) {
   const el = document.getElementById(card.id);
   const d = card.key === 'index' ? selectIndexDisplay(state?.index, liveIndex, today) : state?.[card.key];
   const body = el.querySelector('.card__body');
   const notice = el.querySelector('.notice');
   const foot = el.querySelector('.card__foot');
-  el.querySelector('.badge-slot').innerHTML = d && card.badge ? card.badge(d, today) : '';
+  el.querySelector('.badge-slot').innerHTML = d && card.badge ? card.badge(d, today, time) : '';
 
   if (!d) {
     body.innerHTML = '<p class="empty">尚無資料</p>';
@@ -589,15 +620,16 @@ export function renderAll() {
   if (!state) return;
 
   const activeIndex = selectIndexDisplay(state.index, liveState, today);
+  const indexPhase = getIndexPhase(activeIndex, today, time);
   const liveSig =
     activeIndex === liveState && liveState
       ? `${liveState.date}|${getQuoteTimestampMs(liveState)}|${liveState.close}|${liveState.source}`
       : '';
-  const sig = `${today}|${state.meta?.updatedAt}|${liveSig}`;
+  const sig = `${today}|${state.meta?.updatedAt}|${indexPhase}|${liveSig}`;
   if (sig === lastSig) return;
   lastSig = sig;
 
-  for (const c of CARDS) renderCard(c, state, today, liveState);
+  for (const c of CARDS) renderCard(c, state, today, time, liveState);
 
   const metaEl = document.getElementById('meta-updated');
   if (activeIndex === liveState && liveState?.date === today) {

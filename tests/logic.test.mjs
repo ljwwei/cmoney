@@ -26,6 +26,7 @@ import {
   selectIndexDisplay,
   renderIndex,
   renderFut,
+  getIndexPhase,
   indexBadge,
   createLiveStreamController,
   initVisitCounter,
@@ -274,7 +275,7 @@ test('盤後解析擴充 OHLC：parseTwseIndexHist / parseOpenApiIndexHist', () 
 // 2. 前端：UI 狀態（僅富果 / Yahoo 備援）、單調時間戳、SSE 單例、計次
 // ========================================================
 
-test('前端即時設定、盤中視窗、UI 標籤（僅保留富果盤中即時與 Yahoo 盤中即時備援）與單調時間戳', () => {
+test('前端即時設定、盤中切終盤至已收盤三階段標籤（盤中即時 → 13:30 即時終盤 → 已收盤）與單調時間戳', () => {
   assert.equal(resolveApiOrigin({ metaContent: 'https://cmoney-taiex.example.workers.dev/api/taiex' }), 'https://cmoney-taiex.example.workers.dev');
   assert.equal(resolveLiveApiUrl({ metaContent: 'https://cmoney-taiex.example.workers.dev/' }), 'https://cmoney-taiex.example.workers.dev/api/taiex');
   assert.equal(resolveLiveApiUrl({ search: '?liveApi=https://demo.workers.dev/api/stream', metaContent: 'https://other.workers.dev' }), 'https://demo.workers.dev/api/taiex');
@@ -284,8 +285,9 @@ test('前端即時設定、盤中視窗、UI 標籤（僅保留富果盤中即�
 
   assert.equal(inIntradayWindow('2026-11-13', '08:54:59', []), false);
   assert.equal(inIntradayWindow('2026-11-13', '08:55:00', []), true);
-  assert.equal(inIntradayWindow('2026-11-13', '13:35:00', []), true);
-  assert.equal(inIntradayWindow('2026-11-13', '13:35:01', []), false);
+  assert.equal(inIntradayWindow('2026-11-13', '13:36:00', []), true);
+  assert.equal(inIntradayWindow('2026-11-13', '13:45:00', []), true);
+  assert.equal(inIntradayWindow('2026-11-13', '13:45:01', []), false);
   assert.equal(inIntradayWindow('2026-11-13', '10:00:00', ['2026-11-13']), false);
   assert.equal(inIntradayWindow('2026-11-15', '10:00:00', []), false);
 
@@ -302,8 +304,10 @@ test('前端即時設定、盤中視窗、UI 標籤（僅保留富果盤中即�
     prevClose: 43091.87,
     change: 708.63,
     changePct: 1.64,
+    marketPhase: 'intraday',
     source: 'fugle',
   };
+  const fugleClosingTick = { ...fugleLive, time: '13:30:00', marketPhase: 'closed' };
   const yahooLive = { ...fugleLive, source: 'yahoo' };
   const settled = {
     date: '2026-11-13',
@@ -315,23 +319,47 @@ test('前端即時設定、盤中視窗、UI 標籤（僅保留富果盤中即�
     changePct: 1.35,
     source: 'twse',
   };
+  const settledPendingOhlc = { date: '2026-11-13', close: 43675.12, change: 583.25, changePct: 1.35, source: 'twse', ohlcPending: true };
 
   assert.equal(selectIndexDisplay(prev, fugleLive, '2026-11-13'), fugleLive);
   assert.equal(selectIndexDisplay(settled, fugleLive, '2026-11-13'), settled);
   assert.equal(selectIndexDisplay(prev, { ...fugleLive, date: '2026-11-12' }, '2026-11-13'), prev);
+  // 首筆盤後資料若短暫缺少開高低（ohlcPending），自動沿用盤中 OHLC 不閃空
+  const mergedOhlc = selectIndexDisplay(settledPendingOhlc, fugleLive, '2026-11-13');
+  assert.equal(mergedOhlc.close, 43675.12);
+  assert.equal(mergedOhlc.open, 43719.75);
+  assert.equal(mergedOhlc.high, 44489.48);
+  assert.equal(mergedOhlc.low, 43000.0);
 
   const liveHtml = renderIndex(fugleLive);
   assert.ok(liveHtml.includes('開盤') && liveHtml.includes('43,719.75'));
   assert.ok(liveHtml.includes('最高') && liveHtml.includes('44,489.48'));
   assert.ok(liveHtml.includes('最低') && liveHtml.includes('43,000.00'));
   assert.ok(liveHtml.includes('ohlc__val down') && liveHtml.includes('ohlc__val up'));
-  assert.equal(/證交所盤中|鉅亨|即時終盤/.test(liveHtml), false);
 
-  // 嚴格僅保留兩種即時狀態標籤
-  assert.ok(indexBadge(fugleLive, '2026-11-13').includes('富果盤中即時'));
-  assert.ok(indexBadge(yahooLive, '2026-11-13').includes('Yahoo 盤中即時 (備援)'));
-  assert.equal(indexBadge(settled, '2026-11-13'), '');
-  assert.equal(indexBadge(prev, '2026-11-13'), '');
+  // 1) 盤中（< 13:30:00）：顯示「盤中即時」（不含「富果」字樣）；備援顯示「盤中即時 (備援)」
+  assert.equal(getIndexPhase(fugleLive, '2026-11-13', '13:29:59'), 'intraday');
+  const intradayBadge = indexBadge(fugleLive, '2026-11-13', '13:29:59');
+  assert.ok(intradayBadge.includes('盤中即時') && !intradayBadge.includes('富果'));
+  assert.ok(intradayBadge.includes('live-dot'));
+  assert.ok(indexBadge(yahooLive, '2026-11-13', '10:15:30').includes('盤中即時 (備援)'));
+
+  // 2) 13:30:00 準時切換為「即時終盤」（不論最後一筆推播停在 13:25 或已達 13:30:00）
+  assert.equal(getIndexPhase(fugleLive, '2026-11-13', '13:30:00'), 'closing');
+  const closingBadge = indexBadge(fugleLive, '2026-11-13', '13:30:00');
+  assert.ok(closingBadge.includes('即時終盤') && closingBadge.includes('badge--closing'));
+  assert.equal(closingBadge.includes('live-dot'), false);
+  assert.ok(indexBadge(fugleClosingTick, '2026-11-13', '13:32:00').includes('即時終盤'));
+  assert.ok(indexBadge(yahooLive, '2026-11-13', '13:30:00').includes('即時終盤'));
+
+  // 3) 收到 13:30 後第一筆盤後正式新資料（約 13:34～13:36，source=twse / openapi）：轉為「已收盤」
+  assert.equal(getIndexPhase(settled, '2026-11-13', '13:35:00'), 'settled');
+  const settledBadge = indexBadge(settled, '2026-11-13', '13:35:00');
+  assert.ok(settledBadge.includes('已收盤') && settledBadge.includes('badge--closed'));
+  assert.ok(indexBadge({ ...settled, source: 'openapi' }, '2026-11-13', '13:36:00').includes('已收盤'));
+
+  // 4) 非今日資料（開盤前顯示前一交易日）：不顯示標籤
+  assert.equal(indexBadge(prev, '2026-11-13', '08:30:00'), '');
 
   // 單調時間戳過濾：新報價時間戳必須嚴格 > latestQuoteTimestamp
   assert.equal(getQuoteTimestampMs(fugleLive), ts1);

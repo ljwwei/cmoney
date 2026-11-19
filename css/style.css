@@ -243,10 +243,13 @@ small { font-size: 0.5em; font-weight: 600; margin-left: 0.25em; color: var(--mu
 .badge--block { color: #6ea8ff; }
 .badge--noblock { color: var(--warn); }
 .badge--live { color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
+.badge--closing { color: #818cf8; background: rgba(129, 140, 248, 0.14); }
+.badge--closed { color: var(--flat); background: var(--flat-bg); }
 .badge--backup { color: var(--warn); background: var(--warn-bg); }
 
 @media (prefers-color-scheme: light) {
   .badge--live { color: #0284c7; background: rgba(2, 132, 199, 0.1); }
+  .badge--closing { color: #4f46e5; background: rgba(79, 70, 229, 0.1); }
 }
 
 .live-dot {
