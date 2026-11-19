@@ -1448,13 +1448,13 @@ test('外資台股期貨空單：多日 CSV 前一交易日解析與渲染（增
   const incHtml = renderFut({ foreignNet: -99438, prevForeignNet: -97896 });
   assert.match(incHtml, /class="fut__num down">99,438<small>口<\/small>/);
   assert.match(incHtml, /<span class="chip down">較前一交易日增加 1,542 口<\/span>/);
-  assert.match(incHtml, /前一交易日 97,896 口空單/);
+  assert.match(incHtml, /前一交易日空單 97,896 口/);
 
   // 空單減少：偏多紅色 up
   const decHtml = renderFut({ foreignNet: -95000, prevForeignNet: -99438 });
   assert.match(decHtml, /class="fut__num down">95,000<small>口<\/small>/);
   assert.match(decHtml, /<span class="chip up">較前一交易日減少 4,438 口<\/span>/);
-  assert.match(decHtml, /前一交易日 99,438 口空單/);
+  assert.match(decHtml, /前一交易日空單 99,438 口/);
 
   // 持平：flat
   const flatHtml = renderFut({ foreignNet: -99438, prevForeignNet: -99438 });
@@ -1469,7 +1469,7 @@ test('外資台股期貨空單：多日 CSV 前一交易日解析與渲染（增
   const flipUpHtml = renderFut({ foreignNet: 1000, prevForeignNet: -2000 });
   assert.match(flipUpHtml, /class="fut__num up">1,000<small>口<\/small>/);
   assert.match(flipUpHtml, /<span class="chip up">淨多單（由空轉多 3,000 口）<\/span>/);
-  assert.match(flipUpHtml, /前一交易日 2,000 口空單/);
+  assert.match(flipUpHtml, /前一交易日空單 2,000 口/);
 
   // 首頁標題與 meta 描述已更新
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');

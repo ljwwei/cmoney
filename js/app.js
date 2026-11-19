@@ -495,17 +495,17 @@ export function renderFut(d) {
       const shortDelta = Math.abs(net) - Math.abs(prevNet);
       const word = shortDelta > 0 ? '增加' : shortDelta < 0 ? '減少' : '持平';
       chipText = `較前一交易日${word}${shortDelta === 0 ? '' : ` ${fmt(Math.abs(shortDelta))} 口`}`;
-      prevText = `<br>前一交易日 ${fmt(Math.abs(prevNet))} 口空單`;
+      prevText = `<br>前一交易日空單 ${fmt(Math.abs(prevNet))} 口`;
     } else if (net >= 0 && prevNet >= 0) {
       const word = netDiff > 0 ? '增加' : netDiff < 0 ? '減少' : '持平';
       chipText = `淨多單 較前一交易日${word}${netDiff === 0 ? '' : ` ${fmt(Math.abs(netDiff))} 口`}`;
-      prevText = prevNet === 0 ? '<br>前一交易日多空持平' : `<br>前一交易日 ${fmt(prevNet)} 口淨多單`;
+      prevText = prevNet === 0 ? '<br>前一交易日多空持平' : `<br>前一交易日淨多單 ${fmt(prevNet)} 口`;
     } else if (prevNet < 0 && net > 0) {
       chipText = `淨多單（由空轉多 ${fmt(netDiff)} 口）`;
-      prevText = `<br>前一交易日 ${fmt(Math.abs(prevNet))} 口空單`;
+      prevText = `<br>前一交易日空單 ${fmt(Math.abs(prevNet))} 口`;
     } else {
       chipText = `由多轉空 ${fmt(Math.abs(netDiff))} 口`;
-      prevText = `<br>前一交易日 ${fmt(prevNet)} 口淨多單`;
+      prevText = `<br>前一交易日淨多單 ${fmt(prevNet)} 口`;
     }
   }
 
