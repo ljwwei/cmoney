@@ -1,7 +1,7 @@
 {
   "meta": {
     "holidaysCheckedOn": "2026-11-20",
-    "updatedAt": "2026-11-20T05:53:30.442Z"
+    "updatedAt": "2026-11-20T06:51:21.895Z"
   },
   "closedDates": [
     "2026-01-01",
@@ -68,12 +68,12 @@
     "fetchedAt": "2026-11-20T05:53:30.442Z"
   },
   "futures": {
-    "date": "2026-11-19",
-    "foreignNet": -99219,
-    "long": 12664,
-    "short": 111883,
-    "prevForeignNet": -99438,
-    "fetchedAt": "2026-11-19T06:43:34.527Z"
+    "date": "2026-11-20",
+    "foreignNet": -97863,
+    "long": 16303,
+    "short": 114166,
+    "prevForeignNet": -99219,
+    "fetchedAt": "2026-11-20T06:51:21.895Z"
   },
   "institutional": {
     "date": "2026-11-19",
