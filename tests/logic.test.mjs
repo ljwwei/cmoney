@@ -26,6 +26,7 @@ import {
   selectIndexDisplay,
   renderIndex,
   renderFut,
+  isPostCloseLiveQuote,
   getIndexPhase,
   indexBadge,
   createLiveStreamController,
@@ -307,7 +308,18 @@ test('前端即時設定、盤中切終盤至已收盤三階段標籤（盤中�
     marketPhase: 'intraday',
     source: 'fugle',
   };
-  const fugleClosingTick = { ...fugleLive, time: '13:30:00', marketPhase: 'closed' };
+  const fugleClosingTick = {
+    ...fugleLive,
+    time: '13:30:00',
+    timestampMs: tpe('2026-11-13T13:30:00').getTime(),
+    marketPhase: 'closed',
+  };
+  const fugleSettledTick = {
+    ...fugleLive,
+    time: '13:33:00',
+    timestampMs: tpe('2026-11-13T13:33:00').getTime(),
+    marketPhase: 'closed',
+  };
   const yahooLive = { ...fugleLive, source: 'yahoo' };
   const settled = {
     date: '2026-11-13',
@@ -344,7 +356,9 @@ test('前端即時設定、盤中切終盤至已收盤三階段標籤（盤中�
   assert.ok(intradayBadge.includes('live-dot'));
   assert.ok(indexBadge(yahooLive, '2026-11-13', '10:15:30').includes('盤中即時 (備援)'));
 
-  // 2) 13:30:00 準時切換為「即時終盤」（不論最後一筆推播停在 13:25 或已達 13:30:00）
+  // 2) 13:30:00 準時切換為「即時終盤」（13:30:00 本身仍屬即時終盤，等待尾盤最終結算）
+  assert.equal(isPostCloseLiveQuote(fugleLive, '2026-11-13'), false);
+  assert.equal(isPostCloseLiveQuote(fugleClosingTick, '2026-11-13'), false);
   assert.equal(getIndexPhase(fugleLive, '2026-11-13', '13:30:00'), 'closing');
   const closingBadge = indexBadge(fugleLive, '2026-11-13', '13:30:00');
   assert.ok(closingBadge.includes('即時終盤') && closingBadge.includes('badge--closing'));
@@ -352,7 +366,11 @@ test('前端即時設定、盤中切終盤至已收盤三階段標籤（盤中�
   assert.ok(indexBadge(fugleClosingTick, '2026-11-13', '13:32:00').includes('即時終盤'));
   assert.ok(indexBadge(yahooLive, '2026-11-13', '13:30:00').includes('即時終盤'));
 
-  // 3) 收到 13:30 後第一筆盤後正式新資料（約 13:34～13:36，source=twse / openapi）：轉為「已收盤」
+  // 3) 收到 13:30 後富果尾盤結算跳動（如 13:33:00）立即轉為「已收盤」，或收到盤後正式新資料（twse / openapi）亦顯示「已收盤」
+  assert.equal(isPostCloseLiveQuote(fugleSettledTick, '2026-11-13'), true);
+  assert.equal(getIndexPhase(fugleSettledTick, '2026-11-13', '13:33:00'), 'settled');
+  const fugleSettledBadge = indexBadge(fugleSettledTick, '2026-11-13', '13:33:00');
+  assert.ok(fugleSettledBadge.includes('已收盤') && fugleSettledBadge.includes('badge--closed'));
   assert.equal(getIndexPhase(settled, '2026-11-13', '13:35:00'), 'settled');
   const settledBadge = indexBadge(settled, '2026-11-13', '13:35:00');
   assert.ok(settledBadge.includes('已收盤') && settledBadge.includes('badge--closed'));

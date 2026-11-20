@@ -337,6 +337,7 @@ export function createLiveStreamController({
   return {
     start,
     stop,
+    fetchOnce: fetchSnapshotOnce,
     onVisibilityChange,
     isConnected: () => Boolean(es),
   };
@@ -441,9 +442,21 @@ export function renderIndex(d) {
 }
 
 /**
+ * 判斷即時報價是否已收到「13:30 後的尾盤結算跳動」（例如 13:33 證交所最終收盤指數）。
+ * 13:30:00 本身仍為「即時終盤」；只要成交時間嚴格晚於 13:30:00 即轉「已收盤」並停止續抓。
+ */
+export function isPostCloseLiveQuote(d, today) {
+  if (!d || d.date !== today) return false;
+  if (d.source !== 'fugle' && d.source !== 'yahoo') return false;
+  const tsMs = getQuoteTimestampMs(d);
+  const quoteTime = Number.isFinite(tsMs) ? formatQuoteTime(tsMs) : String(d.time || '');
+  return quoteTime > '13:30:00';
+}
+
+/**
  * 判斷大盤卡片階段：
- *  - 'settled'  ：收到 13:30 後第一筆證交所盤後正式資料（twse / openapi）→「已收盤」（約 13:34～13:36）
- *  - 'closing'  ：13:30:00 後仍顯示即時資料（尚未入帳盤後正式資料）→「即時終盤」
+ *  - 'settled'  ：收到 13:30 後富果尾盤結算跳動（如 13:33），或盤後正式資料（twse / openapi）已入帳 →「已收盤」
+ *  - 'closing'  ：13:30:00 起且尚未收到 13:30 後尾盤結算跳動或盤後正式資料 →「即時終盤」
  *  - 'intraday' ：盤中 13:30 前跳動中 →「盤中即時」（若觸發備援則顯示「盤中即時 (備援)」）
  *  - ''         ：非今日資料（前一交易日）
  */
@@ -451,6 +464,7 @@ export function getIndexPhase(d, today, time = '') {
   if (!d || d.date !== today) return '';
   if (d.source === 'twse' || d.source === 'openapi') return 'settled';
   if (d.source === 'fugle' || d.source === 'yahoo') {
+    if (isPostCloseLiveQuote(d, today)) return 'settled';
     const isClosing = (time && time >= '13:30:00') || d.marketPhase === 'closed' || (d.time && d.time >= '13:30:00');
     return isClosing ? 'closing' : 'intraday';
   }
@@ -1127,27 +1141,46 @@ async function fetchGithubApi() {
 
 const newer = (a, b) => ((a?.meta?.updatedAt ?? '') >= (b?.meta?.updatedAt ?? '') ? a : b);
 
+let postCloseSnapshotDate = '';
+
 function syncLiveLifecycle() {
   if (!liveController || !state) return;
   const { date: today, time } = taipeiNow();
   const forceLive =
     typeof location !== 'undefined' && new URLSearchParams(location.search).get('forceLive') === '1';
-  const settledToday =
+  const settledOfficial =
     state.index?.date === today && (state.index.source === 'twse' || state.index.source === 'openapi');
+  const settledLive = isPostCloseLiveQuote(liveState, today);
+  const settledToday = settledOfficial || settledLive;
 
   if (forceLive || (!settledToday && inIntradayWindow(today, time, state.closedDates ?? []))) {
     liveController.start();
   } else {
     liveController.stop();
+    // 若已過即時銜接視窗但盤後正式檔尚未入帳，重整後單次抓取富果今日收盤快照防退回昨日
+    if (
+      !settledToday &&
+      !liveState &&
+      isTradingDay(today, state.closedDates ?? []) &&
+      time >= '13:30:00' &&
+      postCloseSnapshotDate !== today
+    ) {
+      postCloseSnapshotDate = today;
+      liveController.fetchOnce?.();
+    }
   }
 }
 
 function handleIncomingQuote(raw) {
+  const { date: today } = taipeiNow();
+  // 已鎖定今日 13:30 後尾盤結算報價（如 13:33）即不再持續跳動更新，維持靜止已收盤狀態
+  if (isPostCloseLiveQuote(liveState, today)) return;
   const next = acceptLiveQuote(liveState, raw, latestQuoteTimestamp);
   if (next && next !== liveState) {
     latestQuoteTimestamp = getQuoteTimestampMs(next);
     liveState = next;
     renderAll();
+    syncLiveLifecycle();
   }
 }
 
