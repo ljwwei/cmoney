@@ -8,6 +8,7 @@
 //         10 = 今天還有項目沒抓齊，常駐輪詢（workflow）應稍後再跑一次。
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -21,6 +22,9 @@ import {
 import {
   parseFuturesCsv,
   parseHolidays,
+  mergeClosedDates,
+  parseTwseDisasterClosures,
+  parseDgpaTaipeiClosures,
   parseIndex,
   parseInstitutional,
   parseBlockTradeScope,
@@ -31,6 +35,8 @@ import {
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_FILE = path.join(ROOT, 'data', 'data.json');
+const DISASTER_STAMP_FILE = path.join(os.tmpdir(), 'cmoney-disaster-check.json');
+const DISASTER_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 const UA = 'Mozilla/5.0 (compatible; cmoney-tw-stock-bot/1.0)';
 
 const ymd = (date) => date.replace(/-/g, '');
@@ -209,13 +215,59 @@ async function refreshHolidays(state, today) {
     const list = await getJson('https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule');
     const fresh = parseHolidays(list);
     if (fresh.length) {
-      state.closedDates = [...new Set([...(state.closedDates ?? []), ...fresh])].sort();
+      state.closedDates = mergeClosedDates(state.closedDates, fresh, today);
+      state.inferredClosed = mergeClosedDates(state.inferredClosed, [], today);
       if (!state.meta.holidaysCheckedOn || today > state.meta.holidaysCheckedOn) {
         state.meta.holidaysCheckedOn = today;
       }
     }
   } catch (e) {
     console.warn(`休市日行事曆更新失敗：${e.message}`);
+  }
+}
+
+async function shouldRunDisasterCheck(minutes, nowMs, backfill) {
+  if (backfill) return false;
+  // 僅於上午（含 08:30 早檢）與晚間 20:00 後（含 20:00/20:20/21:20 隔日颱風停班公告期）檢查
+  if (!(minutes < 12 * 60 || minutes >= 20 * 60)) return false;
+  try {
+    const raw = JSON.parse(await readFile(DISASTER_STAMP_FILE, 'utf8'));
+    if (raw?.ts && nowMs - raw.ts < DISASTER_CHECK_INTERVAL_MS) return false;
+  } catch {
+    /* 尚未建立節流檔 */
+  }
+  try {
+    await writeFile(DISASTER_STAMP_FILE, JSON.stringify({ ts: nowMs }), 'utf8');
+  } catch {}
+  return true;
+}
+
+/** 主動偵測證交所天然災害新聞與人事行政總處臺北市停班公告，於前晚或當日 08:30 提前寫入休市日 */
+async function refreshDisasterClosures(state, today) {
+  const [twseNews, dgpaHtml] = await Promise.allSettled([
+    getJson('https://openapi.twse.com.tw/v1/news/newsList'),
+    httpGet('https://www.dgpa.gov.tw/typh/daily/nds.html').then((b) => b.toString('utf8')),
+  ]);
+
+  const detected = [];
+  if (twseNews.status === 'fulfilled') {
+    const dates = parseTwseDisasterClosures(twseNews.value, today);
+    if (dates.length) console.log(`證交所新聞公告偵測到臨時休市：${dates.join(', ')}`);
+    detected.push(...dates);
+  } else {
+    console.warn(`證交所新聞公告查詢失敗：${twseNews.reason?.message ?? twseNews.reason}`);
+  }
+
+  if (dgpaHtml.status === 'fulfilled') {
+    const dates = parseDgpaTaipeiClosures(dgpaHtml.value, today);
+    if (dates.length) console.log(`人事行政總處偵測到臺北市停止上班（休市）：${dates.join(', ')}`);
+    detected.push(...dates);
+  } else {
+    console.warn(`人事行政總處停班停課查詢失敗：${dgpaHtml.reason?.message ?? dgpaHtml.reason}`);
+  }
+
+  if (detected.length) {
+    state.closedDates = mergeClosedDates(state.closedDates, detected, today);
   }
 }
 
@@ -264,18 +316,54 @@ async function main() {
 
   // 每個交易日第一次執行，以及早上的檢查（天災臨時休市通常早上公告）時，更新休市日行事曆
   if (backfill || state.meta.holidaysCheckedOn !== today || minutes < 12 * 60) {
-    const before = stable(state.closedDates) + state.meta.holidaysCheckedOn;
+    const before = stable(state.closedDates) + stable(state.inferredClosed) + state.meta.holidaysCheckedOn;
     await refreshHolidays(state, today);
-    if (before !== stable(state.closedDates) + state.meta.holidaysCheckedOn) changed = true;
+    if (before !== stable(state.closedDates) + stable(state.inferredClosed) + state.meta.holidaysCheckedOn) {
+      changed = true;
+    }
   }
 
-  if (!isTradingDay(today, state.closedDates)) {
+  // 主動偵測證交所新聞公告與人事總處臺北市停班公告（上午早檢＋前晚 20:00 後隔日颱風停班預告，每 15 分鐘節流）
+  if (await shouldRunDisasterCheck(minutes, Date.now(), Boolean(backfill))) {
+    const before = stable(state.closedDates);
+    await refreshDisasterClosures(state, today);
+    if (before !== stable(state.closedDates)) changed = true;
+  }
+
+  // 若今日先前係依 14:15 無資料自動推斷為臨時休市，後續定時喚醒時做單次輕量自癒複檢：
+  // 只要證交所後來釋出今日加權指數即自動撤銷誤判並恢復抓取；否則直接結束不進入輪詢
+  let preFetchedIndex = null;
+  if (!backfill && state.inferredClosed.includes(today) && minutes >= INFER_CLOSED_AT) {
+    try {
+      const probe = await fetchIndex(today);
+      if (probe.status === 'ok') {
+        console.log(`${today} 複檢已取得加權指數，自動撤銷臨時休市推斷並恢復抓取。`);
+        state.inferredClosed = state.inferredClosed.filter((d) => d !== today);
+        state.closedDates = state.closedDates.filter((d) => d !== today);
+        preFetchedIndex = probe;
+        changed = true;
+      } else {
+        console.log(`${today} 臨時休市複檢仍無加權指數資料，維持休市狀態。`);
+        if (changed) await finish(state, nowIso);
+        return;
+      }
+    } catch (e) {
+      console.warn(`${today} 臨時休市複檢失敗：${e.message}`);
+      if (changed) await finish(state, nowIso);
+      return;
+    }
+  }
+
+  if (!backfill && !isTradingDay(today, state.closedDates)) {
     console.log(`${today} 非交易日，不抓取。`);
     if (changed) await finish(state, nowIso);
     return;
   }
 
-  const due = dueTasks(state, now);
+  const effectiveState = backfill
+    ? { ...state, closedDates: (state.closedDates ?? []).filter((d) => d !== today) }
+    : state;
+  const due = dueTasks(effectiveState, now);
   if (
     backfill &&
     !due.includes('index') &&
@@ -297,7 +385,7 @@ async function main() {
   // 1) 加權指數（同時負責偵測臨時休市）
   if (due.includes('index')) {
     try {
-      const r = await fetchIndex(today);
+      const r = preFetchedIndex ?? (await fetchIndex(today));
       if (r.status === 'ok') {
         let { close, change, changePct, open, high, low } = r.value;
         // 證交所若未提供漲跌，改用前一個交易日收盤價自行計算
@@ -323,13 +411,14 @@ async function main() {
             ...(!hasOhlc ? { ohlcPending: true } : {}),
           }) || changed;
         // 若這天先前被誤判為臨時休市，現在有資料就撤銷
-        if (state.inferredClosed.includes(today)) {
+        if (state.inferredClosed.includes(today) || (backfill && state.closedDates.includes(today))) {
           state.inferredClosed = state.inferredClosed.filter((d) => d !== today);
           state.closedDates = state.closedDates.filter((d) => d !== today);
           changed = true;
         }
       } else if (minutes >= INFER_CLOSED_AT && !backfill && r.certain) {
-        console.log(`${today} 已過 ${INFER_CLOSED_AT / 60}:00 仍無加權指數資料，判定為臨時休市，今日不再抓取。`);
+        const inferLabel = `${String(Math.floor(INFER_CLOSED_AT / 60)).padStart(2, '0')}:${String(INFER_CLOSED_AT % 60).padStart(2, '0')}`;
+        console.log(`${today} 已過 ${inferLabel} 仍無加權指數資料，判定為臨時休市，今日不再抓取。`);
         state.inferredClosed = [...new Set([...state.inferredClosed, today])].sort();
         state.closedDates = [...new Set([...state.closedDates, today])].sort();
         changed = true;

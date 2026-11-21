@@ -14,8 +14,8 @@ export const START_AT = {
   margin: 20 * 60 + 30, // 融資餘額
 };
 
-// 交易日、但加權指數到這個時間仍「確定無資料」時，推斷為臨時休市（颱風、天災等）
-export const INFER_CLOSED_AT = 16 * 60;
+// 交易日、但加權指數到這個時間仍「確定無資料」時，推斷為臨時休市（颱風、天災等；正常 13:34–13:36 公布，14:15 判定可避免 14:30 空打期貨與三大法人）
+export const INFER_CLOSED_AT = 14 * 60 + 15;
 
 // 加權指數若先取得收盤價但 OHLC 尚未齊全（ohlcPending），超過這個時間不再重試
 export const INDEX_CONFIRM_UNTIL = 18 * 60;

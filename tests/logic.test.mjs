@@ -2,9 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { dueTasks, remainingTasks, isTradingDay, taipeiParts, institutionalStage } from '../scripts/schedule.mjs';
+import { dueTasks, remainingTasks, isTradingDay, taipeiParts, institutionalStage, INFER_CLOSED_AT } from '../scripts/schedule.mjs';
 import {
   parseHolidays,
+  mergeClosedDates,
+  parseTwseDisasterClosures,
+  parseDgpaTaipeiClosures,
   parseMargin,
   parseFuturesCsv,
   parseIndex,
@@ -1706,4 +1709,77 @@ test('PWA 完整設定：Manifest、PNG 圖示尺寸、Safe Area、與 Service W
   const cachedRes = await offlineJs.responded;
   assert.equal(cachedRes.status, 200);
   assert.equal(await cachedRes.text(), 'v2-fresh-js');
+});
+
+test('休市機制與跨年模擬：2026→2027→2028+ 自動累加、證交所新聞／人事總處臺北市颱風停班偵測與 14:15 保底推斷', () => {
+  assert.equal(INFER_CLOSED_AT, 14 * 60 + 15);
+
+  // 1) 模擬 2026→2027→2028 自動跨年抓取（民國 117 年 = 2028，不覆蓋當年度、自動修剪過舊年份）
+  const year2028 = parseHolidays([
+    { Name: '中華民國開國紀念日', Date: '1170101' },
+    { Name: '國曆新年開始交易日', Date: '1170103' },
+    { Name: '農曆除夕及春節', Date: '1170125' },
+  ]);
+  assert.deepEqual(year2028, ['2028-01-01', '2028-01-25']);
+
+  const merged2027 = mergeClosedDates(
+    ['2025-01-01', '2026-12-25', '2027-01-01', '2027-12-31'],
+    year2028,
+    '2027-08-15',
+  );
+  assert.equal(merged2027.includes('2025-01-01'), false, '早於前一年的舊資料自動修剪');
+  assert.ok(merged2027.includes('2026-12-25'), '保留前一年');
+  assert.ok(merged2027.includes('2027-12-31'), '保留當年度');
+  assert.ok(merged2027.includes('2028-01-01') && merged2027.includes('2028-01-25'), '提前寫入 2028 休市日');
+
+  // 跨到 2028-01-25 00:00:00（週二）當下，不用等 08:30 即不顯示「當日資訊尚未揭露」
+  assert.equal(isTradingDay('2028-01-25', merged2027), false);
+  assert.equal(isPending('2028-01-24', '2028-01-25', merged2027), false);
+
+  // 2) 證交所新聞公告臨時休市解析（正向＋負向防誤判）
+  const twseDates = parseTwseDisasterClosures(
+    [
+      { Title: '臺灣證券交易所集中交易市場7月24日休市一天', Date: '1150723' },
+      { Title: '因凱米颱風來襲，集中交易市場115年7月24日至25日全日休市', Date: '1150723' },
+      { Title: '臺北市下午停止上班，集中交易市場照常交易不休市', Date: '1150723' },
+      { Title: '去年的颱風假回顧：集中交易市場7月24日休市一天', Date: '1140723' },
+    ],
+    '2026-07-23',
+  );
+  assert.deepEqual(twseDates, ['2026-07-24', '2026-07-25']);
+
+  // 3) 人事行政總處臺北市停班公告解析（前晚「明天停止上班」、當早「今天停止上班／上午停止上班」、多項防誤判）
+  assert.deepEqual(
+    parseDgpaTaipeiClosures('<TBODY><TR><TD><h2>無停班停課訊息。</h2></TD></TR></TBODY>', '2026-07-23'),
+    [],
+  );
+
+  // 前晚 20:20 偵測到「明天停止上班」→ 提前把隔天 2026-07-24 寫入 closedDates（00:00 前就生效！）
+  const nightBeforeHtml = `
+    <div class="Header_YMD">115年 07月 23日 天然災害停止上班及上課情形</div>
+    <TABLE><TBODY class="Table_Body">
+      <TR><TD headers='city_Name'>臺北市</TD><TD>今天照常上班、照常上課。<br>明天停止上班、停止上課。</TD></TR>
+      <TR><TD headers='city_Name'>高雄市</TD><TD>今天停止上班、停止上課。</TD></TR>
+    </TBODY></TABLE>
+  `;
+  assert.deepEqual(parseDgpaTaipeiClosures(nightBeforeHtml, '2026-07-23'), ['2026-07-24']);
+
+  // 清晨 08:30 偵測到「今天上午停止上班，下午照常上班」或「各機關學校停止上班」（依證交所規定上午停班即全日休市）
+  const morningHtml = `
+    <div class="Header_YMD">115年 07月 24日 天然災害停止上班及上課情形</div>
+    <TABLE><TBODY class="Table_Body">
+      <TR><TD headers='city_Name'>臺北市</TD><TD>今天上午停止上班、停止上課，下午照常上班、照常上課。</TD></TR>
+    </TBODY></TABLE>
+  `;
+  assert.deepEqual(parseDgpaTaipeiClosures(morningHtml, '2026-07-24'), ['2026-07-24']);
+
+  // 負向防誤判：僅停課照常上班、下午停班、上午照常下午停班、個別山區國小、外縣市停班皆絕不觸發休市
+  const falsePositiveHtml = `
+    <div class="Header_YMD">115年 07月 24日 天然災害停止上班及上課情形</div>
+    <TABLE><TBODY class="Table_Body">
+      <TR><TD headers='city_Name'>臺北市</TD><TD>今天停止上課、照常上班。<br>下午停止上班、停止上課。<br>上午照常上班，下午停止上班。<br>陽明山國小今天停止上班、停止上課。<br>士林區部分山區停止上班。</TD></TR>
+      <TR><TD headers='city_Name'>臺南市</TD><TD>今天停止上班、停止上課。</TD></TR>
+    </TBODY></TABLE>
+  `;
+  assert.deepEqual(parseDgpaTaipeiClosures(falsePositiveHtml, '2026-07-24'), []);
 });
