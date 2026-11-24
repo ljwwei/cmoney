@@ -1,7 +1,7 @@
 {
   "meta": {
     "holidaysCheckedOn": "2026-11-24",
-    "updatedAt": "2026-11-24T00:30:15.730Z"
+    "updatedAt": "2026-11-24T05:36:06.594Z"
   },
   "closedDates": [
     "2026-01-01",
@@ -57,15 +57,15 @@
   ],
   "inferredClosed": [],
   "index": {
-    "date": "2026-11-23",
-    "close": 36811.89,
-    "change": 778.6,
-    "changePct": 2.16,
-    "open": 35899.48,
-    "high": 37108.2,
-    "low": 35442.41,
+    "date": "2026-11-24",
+    "close": 40122.35,
+    "change": 3310.46,
+    "changePct": 8.99,
+    "open": 39148.91,
+    "high": 40180.38,
+    "low": 39148.91,
     "source": "twse",
-    "fetchedAt": "2026-11-23T05:36:23.403Z"
+    "fetchedAt": "2026-11-24T05:36:06.594Z"
   },
   "futures": {
     "date": "2026-11-23",
